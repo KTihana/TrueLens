@@ -7,7 +7,8 @@ import com.truelens.camera.grading.LightroomGrade
 
 class CameraGlSurfaceView(
     context: Context,
-    onSurfaceReady: (Surface) -> Unit
+    onSurfaceReady: (Surface) -> Unit,
+    onHistogramSampled: ((FloatArray) -> Unit)? = null
 ) : GLSurfaceView(context) {
 
     val renderer: LiveGradingRenderer
@@ -16,10 +17,15 @@ class CameraGlSurfaceView(
         setEGLContextClientVersion(2)
         renderer = LiveGradingRenderer(
             onSurfaceReady = onSurfaceReady,
-            requestRenderCallback = { requestRender() }
+            requestRenderCallback = { requestRender() },
+            onHistogramSampled = onHistogramSampled
         )
         setRenderer(renderer)
         renderMode = RENDERMODE_WHEN_DIRTY
+    }
+
+    fun configureCameraGeometry(width: Int, height: Int, sensorOrientation: Int) {
+        renderer.configureCameraGeometry(width, height, sensorOrientation)
     }
 
     fun updateGrade(

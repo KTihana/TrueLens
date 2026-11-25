@@ -283,11 +283,25 @@ fun CameraScreen(
                     )
                 },
             factory = { ctx ->
-                CameraGlSurfaceView(ctx) { surface ->
-                    viewModel.onPreviewSurfaceReady(surface)
-                }.also { glSurfaceRef = it }
+                CameraGlSurfaceView(
+                    context = ctx,
+                    onSurfaceReady = { surface ->
+                        viewModel.onPreviewSurfaceReady(surface)
+                    },
+                    onHistogramSampled = { bins ->
+                        viewModel.onLiveHistogramSampled(bins)
+                    }
+                ).also { glSurfaceRef = it }
             },
             update = { glView ->
+                state.activeLens?.let { lens ->
+                    glView.configureCameraGeometry(
+                        width = lens.previewSize.width,
+                        height = lens.previewSize.height,
+                        sensorOrientation = lens.sensorOrientation
+                    )
+                }
+                glView.renderer.histogramSamplingEnabled = state.settings.histogram || state.settings.trueLightAuto
                 glView.updateGrade(
                     grade = state.grade,
                     focusPeaking = state.settings.focusPeaking,

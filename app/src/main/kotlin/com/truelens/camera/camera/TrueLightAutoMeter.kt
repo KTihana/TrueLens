@@ -95,8 +95,11 @@ object TrueLightAutoMeter {
             nextEv = (currentEvSteps + 1).coerceAtMost(maxEvSteps)
         }
 
-        // Clamp auto-assist to a tasteful ±6 steps (±2.0 EV) so it never goes extreme
-        val clamped = nextEv.coerceIn(maxOf(minEvSteps, -6), minOf(maxEvSteps, 6))
+        // Clamp auto-assist to a safe ±3 steps (±1.0 EV) so it never over-darkens a photo
+        if (meanLuma < 0.03f) {
+            return TrueLightAnalysis(scene = scene, ambientLux = ambientLux, recommendedEvSteps = 0)
+        }
+        val clamped = nextEv.coerceIn(maxOf(minEvSteps, -3), minOf(maxEvSteps, 3))
 
         return TrueLightAnalysis(
             scene = scene,

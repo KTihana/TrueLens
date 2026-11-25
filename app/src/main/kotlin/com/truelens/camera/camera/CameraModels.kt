@@ -90,6 +90,7 @@ data class LensInfo(
     val aeCompensationStep: Rational,
     val activeArraySize: Rect,
     val sensorOrientation: Int,
+    val previewSize: Size,
     val maxRawSize: Size?,
     val maxJpegSize: Size,
     val displayLabel: String

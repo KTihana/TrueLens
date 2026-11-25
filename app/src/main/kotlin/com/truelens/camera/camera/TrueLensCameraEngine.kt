@@ -8,6 +8,7 @@ import android.graphics.BitmapFactory
 import android.graphics.ImageFormat
 import android.graphics.Matrix
 import android.graphics.Rect
+import android.graphics.SurfaceTexture
 import android.hardware.camera2.CameraCaptureSession
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraDevice
@@ -21,9 +22,11 @@ import android.hardware.camera2.params.MeteringRectangle
 import android.hardware.camera2.params.OutputConfiguration
 import android.hardware.camera2.params.RggbChannelVector
 import android.hardware.camera2.params.SessionConfiguration
+import android.media.ExifInterface
 import android.media.Image
 import android.media.ImageReader
 import android.media.MediaRecorder
+import java.io.ByteArrayInputStream
 import android.net.Uri
 import android.os.Build
 import android.os.Environment
@@ -36,6 +39,7 @@ import android.util.Range
 import android.util.Rational
 import android.util.Size
 import android.view.Surface
+import com.truelens.camera.gl.AspectRatioMath
 import com.truelens.camera.grading.BitmapGrader
 import com.truelens.camera.grading.CubeLut
 import com.truelens.camera.grading.LightroomGrade
@@ -68,15 +72,15 @@ class TrueLensCameraEngine(
     private var previewSurface: Surface? = null
     private var jpegReader: ImageReader? = null
     private var rawReader: ImageReader? = null
-    private var histogramReader: ImageReader? = null
 
     private var activeLens: LensInfo? = null
     private var activeCharacteristics: CameraCharacteristics? = null
+    private var supportedEdgeModes: IntArray = IntArray(0)
+    private var supportedNrModes: IntArray = IntArray(0)
     private var currentSettings: ManualSettings = ManualSettings()
     private var currentGrade: LightroomGrade = LightroomGrade.NEUTRAL
     private var zoomRatio: Float = 1.0f
 
-    private var lastFrameHistogramTime = 0L
     private var lastTelemetryTime = 0L
 
     // Pending capture correlation for RAW DNG + JPEG dual-save
@@ -152,6 +156,8 @@ class TrueLensCameraEngine(
                 val jpegSizes = map?.getOutputSizes(ImageFormat.JPEG)
                 val maxJpeg = jpegSizes?.maxByOrNull { it.width.toLong() * it.height.toLong() }
                     ?: Size(1920, 1080)
+                val previewSizes = map?.getOutputSizes(SurfaceTexture::class.java)
+                val matchedPreview = AspectRatioMath.chooseMatchingPreviewSize(previewSizes, maxJpeg)
 
                 val label = if (isFront) {
                     "Front"
@@ -181,6 +187,7 @@ class TrueLensCameraEngine(
                         aeCompensationStep = aeStep,
                         activeArraySize = activeArray,
                         sensorOrientation = sensorOrientation,
+                        previewSize = matchedPreview,
                         maxRawSize = maxRaw,
                         maxJpegSize = maxJpeg,
                         displayLabel = label
@@ -213,8 +220,6 @@ class TrueLensCameraEngine(
             jpegReader = null
             rawReader?.close()
             rawReader = null
-            histogramReader?.close()
-            histogramReader = null
             pendingRawImage?.close()
             pendingRawImage = null
         } catch (e: Exception) {
@@ -240,7 +245,10 @@ class TrueLensCameraEngine(
             cameraDevice?.close()
             cameraDevice = null
 
-            activeCharacteristics = cameraManager.getCameraCharacteristics(lens.cameraId)
+            val chars = cameraManager.getCameraCharacteristics(lens.cameraId)
+            activeCharacteristics = chars
+            supportedEdgeModes = chars.get(CameraCharacteristics.EDGE_AVAILABLE_EDGE_MODES) ?: IntArray(0)
+            supportedNrModes = chars.get(CameraCharacteristics.NOISE_REDUCTION_AVAILABLE_NOISE_REDUCTION_MODES) ?: IntArray(0)
 
             cameraManager.openCamera(
                 lens.cameraId,
@@ -278,7 +286,6 @@ class TrueLensCameraEngine(
         try {
             jpegReader?.close()
             rawReader?.close()
-            histogramReader?.close()
 
             val outputs = mutableListOf<Surface>()
             outputs.add(surface)
@@ -314,7 +321,7 @@ class TrueLensCameraEngine(
             }
             outputs.add(jpegReader!!.surface)
 
-            // Pure 12/14-bit Bayer RAW_SENSOR output when hardware supports it
+            // Pure 12/14-bit Bayer RAW_SENSOR output (strictly <= 3 outputs for universal HAL compatibility)
             if (lens.supportsRawSensor && lens.maxRawSize != null) {
                 rawReader = ImageReader.newInstance(
                     lens.maxRawSize.width,
@@ -331,24 +338,6 @@ class TrueLensCameraEngine(
                 }
                 outputs.add(rawReader!!.surface)
             }
-
-            // Lightweight YUV stream for real-time 64-bin luminance histogram
-            histogramReader = ImageReader.newInstance(160, 120, ImageFormat.YUV_420_888, 2).apply {
-                setOnImageAvailableListener({ reader ->
-                    val image = reader.acquireLatestImage() ?: return@setOnImageAvailableListener
-                    try {
-                        val now = System.currentTimeMillis()
-                        if (currentSettings.histogram && now - lastFrameHistogramTime >= 120L) {
-                            lastFrameHistogramTime = now
-                            val bins = computeHistogram(image)
-                            onHistogram(bins)
-                        }
-                    } finally {
-                        image.close()
-                    }
-                }, handler)
-            }
-            outputs.add(histogramReader!!.surface)
 
             val outputConfigs = outputs.map { OutputConfiguration(it) }
             val sessionConfig = SessionConfiguration(
@@ -406,7 +395,6 @@ class TrueLensCameraEngine(
 
             val builder = device.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW)
             builder.addTarget(surface)
-            histogramReader?.surface?.let { builder.addTarget(it) }
             applyRequestParameters(builder, currentSettings)
             builder.set(CaptureRequest.CONTROL_AF_REGIONS, arrayOf(region))
             builder.set(CaptureRequest.CONTROL_AE_REGIONS, arrayOf(region))
@@ -634,13 +622,10 @@ class TrueLensCameraEngine(
         pendingCaptureSettings = settings
 
         try {
-            // Use TEMPLATE_MANUAL when Zero-AI bypass + manual sensor is supported, else STILL_CAPTURE
-            val template = if (settings.zeroAiBypass && lens.supportsManualSensor) {
-                CameraDevice.TEMPLATE_MANUAL
-            } else {
-                CameraDevice.TEMPLATE_STILL_CAPTURE
-            }
-            val builder = device.createCaptureRequest(template)
+            // CRITICAL: Always use TEMPLATE_STILL_CAPTURE so CONTROL_MODE_AUTO, color matrices,
+            // lens shading, and converged AE/AWB remain intact on every Android device.
+            // (TEMPLATE_MANUAL defaults CONTROL_MODE=OFF and minimum shutter -> pitch black photos!)
+            val builder = device.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE)
             if (wantJpeg) jpegReader?.surface?.let { builder.addTarget(it) }
             if (wantRaw) rawReader?.surface?.let { builder.addTarget(it) }
 
@@ -676,7 +661,6 @@ class TrueLensCameraEngine(
         try {
             val builder = device.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW)
             builder.addTarget(surface)
-            histogramReader?.surface?.let { builder.addTarget(it) }
             applyRequestParameters(builder, currentSettings)
 
             session.setRepeatingRequest(
@@ -721,7 +705,10 @@ class TrueLensCameraEngine(
     private fun applyRequestParameters(builder: CaptureRequest.Builder, settings: ManualSettings) {
         val lens = activeLens ?: return
 
-        // --- ZERO-AI OEM BYPASS PIPELINE ---
+        // Always keep CONTROL_MODE_AUTO so individual AE/AF/AWB settings are honored by the HAL
+        builder.set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO)
+
+        // --- ZERO-AI OEM BYPASS PIPELINE (strictly guarded by hardware-supported modes) ---
         if (settings.zeroAiBypass) {
             builder.set(CaptureRequest.CONTROL_SCENE_MODE, CaptureRequest.CONTROL_SCENE_MODE_DISABLED)
             builder.set(CaptureRequest.CONTROL_EFFECT_MODE, CaptureRequest.CONTROL_EFFECT_MODE_OFF)
@@ -730,13 +717,17 @@ class TrueLensCameraEngine(
                 CaptureRequest.STATISTICS_FACE_DETECT_MODE,
                 CaptureRequest.STATISTICS_FACE_DETECT_MODE_OFF
             )
-            // Disable artificial edge sharpening & aggressive noise smearing
-            builder.set(CaptureRequest.EDGE_MODE, CaptureRequest.EDGE_MODE_OFF)
-            builder.set(CaptureRequest.NOISE_REDUCTION_MODE, CaptureRequest.NOISE_REDUCTION_MODE_OFF)
-            builder.set(
-                CaptureRequest.COLOR_CORRECTION_ABERRATION_MODE,
-                CaptureRequest.COLOR_CORRECTION_ABERRATION_MODE_OFF
-            )
+            // Disable artificial edge sharpening & aggressive noise smearing only if HAL supports it
+            if (supportedEdgeModes.contains(CaptureRequest.EDGE_MODE_OFF)) {
+                builder.set(CaptureRequest.EDGE_MODE, CaptureRequest.EDGE_MODE_OFF)
+            } else if (supportedEdgeModes.contains(CaptureRequest.EDGE_MODE_FAST)) {
+                builder.set(CaptureRequest.EDGE_MODE, CaptureRequest.EDGE_MODE_FAST)
+            }
+            if (supportedNrModes.contains(CaptureRequest.NOISE_REDUCTION_MODE_MINIMAL)) {
+                builder.set(CaptureRequest.NOISE_REDUCTION_MODE, CaptureRequest.NOISE_REDUCTION_MODE_MINIMAL)
+            } else if (supportedNrModes.contains(CaptureRequest.NOISE_REDUCTION_MODE_OFF)) {
+                builder.set(CaptureRequest.NOISE_REDUCTION_MODE, CaptureRequest.NOISE_REDUCTION_MODE_OFF)
+            }
             builder.set(CaptureRequest.HOT_PIXEL_MODE, CaptureRequest.HOT_PIXEL_MODE_FAST)
         }
 
@@ -845,8 +836,24 @@ class TrueLensCameraEngine(
                     val finalBytes = if (needTransform) {
                         val decoded = BitmapFactory.decodeByteArray(jpegBytes, 0, jpegBytes.size)
                         if (decoded != null) {
-                            val oriented = if (lens.isFront && settings.mirrorFrontSave) {
-                                val m = Matrix().apply { postScale(-1f, 1f, decoded.width / 2f, decoded.height / 2f) }
+                            // Respect EXIF orientation before re-encoding so graded/mirrored photos never rotate sideways
+                            val exifRot = try {
+                                when (ExifInterface(ByteArrayInputStream(jpegBytes)).getAttributeInt(
+                                    ExifInterface.TAG_ORIENTATION,
+                                    ExifInterface.ORIENTATION_NORMAL
+                                )) {
+                                    ExifInterface.ORIENTATION_ROTATE_90 -> 90f
+                                    ExifInterface.ORIENTATION_ROTATE_180 -> 180f
+                                    ExifInterface.ORIENTATION_ROTATE_270 -> 270f
+                                    else -> 0f
+                                }
+                            } catch (_: Exception) {
+                                0f
+                            }
+                            val m = Matrix()
+                            if (exifRot != 0f) m.postRotate(exifRot)
+                            if (lens.isFront && settings.mirrorFrontSave) m.postScale(-1f, 1f)
+                            val oriented = if (!m.isIdentity) {
                                 Bitmap.createBitmap(decoded, 0, 0, decoded.width, decoded.height, m, true).also {
                                     decoded.recycle()
                                 }
@@ -907,14 +914,26 @@ class TrueLensCameraEngine(
             put(MediaStore.Images.Media.DISPLAY_NAME, displayName)
             put(MediaStore.Images.Media.MIME_TYPE, "image/x-adobe-dng")
             put(MediaStore.Images.Media.RELATIVE_PATH, "${Environment.DIRECTORY_PICTURES}/TrueLens/RAW")
+            put(MediaStore.Images.Media.IS_PENDING, 1)
         }
-        val uri = context.contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
+        val cr = context.contentResolver
+        val uri = cr.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
             ?: return null
-        context.contentResolver.openOutputStream(uri)?.use { stream ->
+        cr.openOutputStream(uri)?.use { stream ->
             DngCreator(characteristics, captureResult).use { dngCreator ->
+                val exifOrient = when (activeLens?.sensorOrientation ?: 90) {
+                    90 -> ExifInterface.ORIENTATION_ROTATE_90
+                    180 -> ExifInterface.ORIENTATION_ROTATE_180
+                    270 -> ExifInterface.ORIENTATION_ROTATE_270
+                    else -> ExifInterface.ORIENTATION_NORMAL
+                }
+                dngCreator.setOrientation(exifOrient)
                 dngCreator.writeImage(stream, rawImage)
             }
+            stream.flush()
         }
+        val done = ContentValues().apply { put(MediaStore.Images.Media.IS_PENDING, 0) }
+        cr.update(uri, done, null, null)
         return uri
     }
 
@@ -923,12 +942,17 @@ class TrueLensCameraEngine(
             put(MediaStore.Images.Media.DISPLAY_NAME, displayName)
             put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
             put(MediaStore.Images.Media.RELATIVE_PATH, "${Environment.DIRECTORY_PICTURES}/TrueLens")
+            put(MediaStore.Images.Media.IS_PENDING, 1)
         }
-        val uri = context.contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
+        val cr = context.contentResolver
+        val uri = cr.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
             ?: return null
-        context.contentResolver.openOutputStream(uri)?.use { stream ->
+        cr.openOutputStream(uri)?.use { stream ->
             stream.write(bytes)
+            stream.flush()
         }
+        val done = ContentValues().apply { put(MediaStore.Images.Media.IS_PENDING, 0) }
+        cr.update(uri, done, null, null)
         return uri
     }
 

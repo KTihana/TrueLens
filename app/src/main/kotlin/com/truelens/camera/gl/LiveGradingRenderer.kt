@@ -20,7 +20,8 @@ import javax.microedition.khronos.opengles.GL10
  */
 class LiveGradingRenderer(
     private val onSurfaceReady: (Surface) -> Unit,
-    private val requestRenderCallback: () -> Unit
+    private val requestRenderCallback: () -> Unit,
+    private val onHistogramSampled: ((FloatArray) -> Unit)? = null
 ) : GLSurfaceView.Renderer {
 
     @Volatile var grade: LightroomGrade = LightroomGrade.NEUTRAL
@@ -33,6 +34,14 @@ class LiveGradingRenderer(
     @Volatile var stabRollRad: Float = 0f
     @Volatile var stabScale: Float = 1.0f
     @Volatile var splitScreenPos: Float = -1f // -1 = off, 0..1 = live vertical Before/After divider
+    @Volatile var histogramSamplingEnabled: Boolean = true
+
+    @Volatile private var bufferWidth: Int = 1440
+    @Volatile private var bufferHeight: Int = 1080
+    @Volatile private var sensorOrientationDeg: Int = 90
+    @Volatile private var pendingBufferResize: Boolean = false
+    private var lastHistogramSampleMs: Long = 0L
+    private var histReadBuf: ByteBuffer? = null
 
     private var programId: Int = 0
     private var oesTextureId: Int = 0
@@ -53,6 +62,7 @@ class LiveGradingRenderer(
 
     // Uniform locations
     private var uTexMatrixLoc = -1
+    private var uQuadScaleLoc = -1
     private var uExposureLoc = -1
     private var uContrastLoc = -1
     private var uHighlightsLoc = -1
@@ -91,6 +101,7 @@ class LiveGradingRenderer(
         }
 
         uTexMatrixLoc = GLES20.glGetUniformLocation(programId, "uTexMatrix")
+        uQuadScaleLoc = GLES20.glGetUniformLocation(programId, "uQuadScale")
         uExposureLoc = GLES20.glGetUniformLocation(programId, "uExposure")
         uContrastLoc = GLES20.glGetUniformLocation(programId, "uContrast")
         uHighlightsLoc = GLES20.glGetUniformLocation(programId, "uHighlights")
@@ -145,7 +156,7 @@ class LiveGradingRenderer(
         outputSurface?.release()
 
         surfaceTexture = SurfaceTexture(oesTextureId).apply {
-            setDefaultBufferSize(1920, 1080)
+            setDefaultBufferSize(bufferWidth, bufferHeight)
             setOnFrameAvailableListener {
                 frameAvailable.set(true)
                 requestRenderCallback()
@@ -153,6 +164,21 @@ class LiveGradingRenderer(
         }
         outputSurface = Surface(surfaceTexture)
         onSurfaceReady(outputSurface!!)
+    }
+
+    fun configureCameraGeometry(width: Int, height: Int, sensorOrientation: Int) {
+        val w = width.coerceAtLeast(1)
+        val h = height.coerceAtLeast(1)
+        if (w == bufferWidth && h == bufferHeight && sensorOrientation == sensorOrientationDeg) return
+        bufferWidth = w
+        bufferHeight = h
+        sensorOrientationDeg = sensorOrientation
+        pendingBufferResize = true
+        try {
+            surfaceTexture?.setDefaultBufferSize(w, h)
+        } catch (_: Exception) {
+        }
+        requestRenderCallback()
     }
 
     override fun onSurfaceChanged(gl: GL10?, width: Int, height: Int) {
@@ -164,6 +190,13 @@ class LiveGradingRenderer(
     override fun onDrawFrame(gl: GL10?) {
         GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
         val st = surfaceTexture ?: return
+        if (pendingBufferResize) {
+            pendingBufferResize = false
+            try {
+                st.setDefaultBufferSize(bufferWidth, bufferHeight)
+            } catch (_: Exception) {
+            }
+        }
         if (frameAvailable.compareAndSet(true, false)) {
             try {
                 st.updateTexImage()
@@ -177,12 +210,20 @@ class LiveGradingRenderer(
 
         frameCounter += 0.03f
         val g = grade
+        val quadScale = AspectRatioMath.computeExactFitScale(
+            bufferWidth = bufferWidth,
+            bufferHeight = bufferHeight,
+            sensorOrientationDeg = sensorOrientationDeg,
+            viewportWidth = viewportW,
+            viewportHeight = viewportH
+        )
 
         GLES20.glUseProgram(programId)
         GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
         GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, oesTextureId)
 
         GLES20.glUniformMatrix4fv(uTexMatrixLoc, 1, false, texMatrix, 0)
+        GLES20.glUniform2f(uQuadScaleLoc, quadScale.scaleX, quadScale.scaleY)
         GLES20.glUniform1f(uExposureLoc, g.exposure)
         GLES20.glUniform1f(uContrastLoc, g.contrast)
         GLES20.glUniform1f(uHighlightsLoc, g.highlights)
@@ -223,6 +264,48 @@ class LiveGradingRenderer(
 
         GLES20.glDisableVertexAttribArray(posLoc)
         GLES20.glDisableVertexAttribArray(texLoc)
+
+        // Lightweight GPU-rendered histogram sampling every 220ms (zero extra Camera2 stream!)
+        val histCb = onHistogramSampled
+        if (histogramSamplingEnabled && histCb != null) {
+            val now = System.currentTimeMillis()
+            if (now - lastHistogramSampleMs >= 220L) {
+                lastHistogramSampleMs = now
+                sampleRenderedHistogram(quadScale, histCb)
+            }
+        }
+    }
+
+    private fun sampleRenderedHistogram(
+        quadScale: AspectRatioMath.QuadScale,
+        callback: (FloatArray) -> Unit
+    ) {
+        val sampleW = 48
+        val sampleH = 48
+        val drawW = (viewportW * quadScale.scaleX).toInt().coerceAtLeast(sampleW)
+        val drawH = (viewportH * quadScale.scaleY).toInt().coerceAtLeast(sampleH)
+        val startX = ((viewportW - sampleW) / 2).coerceAtLeast(0)
+        val startY = ((viewportH - sampleH) / 2).coerceAtLeast(0)
+        if (startX + sampleW > viewportW || startY + sampleH > viewportH) return
+
+        val buf = histReadBuf ?: ByteBuffer.allocateDirect(sampleW * sampleH * 4)
+            .order(ByteOrder.nativeOrder()).also { histReadBuf = it }
+        buf.position(0)
+        GLES20.glReadPixels(startX, startY, sampleW, sampleH, GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, buf)
+
+        val bins = IntArray(64)
+        var maxCount = 1
+        val totalPixels = sampleW * sampleH
+        for (i in 0 until totalPixels) {
+            val off = i * 4
+            val r = buf.get(off).toInt() and 0xFF
+            val g = buf.get(off + 1).toInt() and 0xFF
+            val b = buf.get(off + 2).toInt() and 0xFF
+            val luma = (r * 77 + g * 150 + b * 29) ushr 8
+            val count = ++bins[luma ushr 2]
+            if (count > maxCount) maxCount = count
+        }
+        callback(FloatArray(64) { idx -> bins[idx].toFloat() / maxCount.toFloat() })
     }
 
     fun release() {
@@ -279,10 +362,11 @@ class LiveGradingRenderer(
             attribute vec4 aPosition;
             attribute vec4 aTexCoord;
             uniform mat4 uTexMatrix;
+            uniform vec2 uQuadScale;
             varying vec2 vTexCoord;
             varying vec2 vRawUv;
             void main() {
-                gl_Position = aPosition;
+                gl_Position = vec4(aPosition.x * uQuadScale.x, aPosition.y * uQuadScale.y, 0.0, 1.0);
                 vTexCoord = (uTexMatrix * aTexCoord).xy;
                 vRawUv = aTexCoord.xy;
             }

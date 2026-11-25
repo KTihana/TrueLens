@@ -1073,6 +1073,11 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         )
     }
 
+    fun onLiveHistogramSampled(bins: FloatArray) {
+        _uiState.update { it.copy(histogram = bins) }
+        evaluateTrueLightAuto(bins)
+    }
+
     fun updateAmbientLux(lux: Float) {
         latestAmbientLux = lux
     }
