@@ -50,8 +50,8 @@ import androidx.compose.foundation.Canvas
 import com.truelens.camera.pose.PoseBlendMode
 import com.truelens.camera.pose.PoseOverlayState
 
-private val OverlayAmber = Color(0xFFFFB300)
-private val OverlayCyan = Color(0xFF00E5FF)
+private val OverlayAmber = TrueLensPalette.AccentViolet
+private val OverlayCyan = Color(0xFFFFFFFF)
 
 /**
  * Interactive full-screen pose guide layer rendered over the live camera preview.

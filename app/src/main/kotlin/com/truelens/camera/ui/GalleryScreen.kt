@@ -7,6 +7,7 @@ import android.graphics.BitmapFactory
 import android.net.Uri
 import android.os.Environment
 import android.provider.MediaStore
+import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -61,6 +62,7 @@ fun GalleryScreen(
     onClose: () -> Unit,
     onSelectPhotoForDarkroom: (Uri, String) -> Unit
 ) {
+    BackHandler(onBack = onClose)
     val context = LocalContext.current
     val photos by produceState<List<GalleryPhotoItem>>(initialValue = emptyList()) {
         value = queryTrueLensGallery(context)
@@ -88,16 +90,15 @@ fun GalleryScreen(
             }
             Column {
                 Text(
-                    text = "TRUELENS GALLERY",
+                    text = "Gallery",
                     color = Color.White,
-                    fontSize = 14.sp,
-                    fontWeight = FontWeight.Bold,
-                    fontFamily = FontFamily.Monospace
+                    fontSize = 18.sp,
+                    fontWeight = FontWeight.SemiBold
                 )
                 Text(
-                    text = "${photos.size} photo(s) • Tap any shot to grade in Darkroom",
-                    color = Color(0xFFA0A4AE),
-                    fontSize = 10.sp
+                    text = "${photos.size} photo(s) • Tap to edit",
+                    color = TrueLensPalette.MutedGray,
+                    fontSize = 12.sp
                 )
             }
         }
@@ -149,21 +150,17 @@ private fun GalleryTile(
     val context = LocalContext.current
     val bmp by produceState<Bitmap?>(initialValue = null, item.uri) {
         value = withContext(Dispatchers.IO) {
-            try {
-                val opts = BitmapFactory.Options().apply { inSampleSize = 4 }
-                context.contentResolver.openInputStream(item.uri)?.use {
-                    BitmapFactory.decodeStream(it, null, opts)
-                }
-            } catch (_: Exception) {
-                null
-            }
+            com.truelens.camera.camera.ExifBitmapLoader.loadScaled(context, item.uri, 360)
         }
     }
 
     val badge = when {
-        item.displayName.contains("Pano", ignoreCase = true) -> "PANO"
+        item.displayName.contains("Pano", ignoreCase = true) -> "PANORAMA"
+        item.displayName.contains("Dual", ignoreCase = true) -> "DUAL"
+        item.displayName.contains("Scan", ignoreCase = true) -> "DOCUMENT"
+        item.displayName.contains("LongExp", ignoreCase = true) -> "LONG EXP"
         item.displayName.contains("Edit", ignoreCase = true) -> "EDIT"
-        else -> "JPG"
+        else -> "PHOTO"
     }
 
     Box(

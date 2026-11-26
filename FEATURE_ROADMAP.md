@@ -66,4 +66,22 @@ A living master list of every feature built, verified, and planned for **TrueLen
 - [x] **RGB Tone Curves & HSL Color Mixer (`HSL` Tab)** — Fine-tune Red Sat, Skin Luminance, Green Foliage Sat, Sky Sat/Depth, and Shadows/Midtones/Highlights Tone Curve live in OpenGL + Darkroom
 - [x] **Time-Lapse MP4 Video Compiler** — Automatically compiles intervalometer frames into a smooth 24fps H.264 MP4 in `Movies/TrueLens`
 - [x] **Super Macro Focus Stacking Burst** — Automatically sweeps focus across 5 focal planes and merges the sharpest pixels per plane via Laplacian sharpness (`FocusStacker.kt`)
-- [x] **Optical Perspective / Keystone Straightener** — Pure geometric vertical tilt & rotation straightening in Darkroom (`V-TILT` & `ROT` sliders, zero AI distortion)
+- [x] **Optical Perspective / Keystone Straightener** — Pure geometric `Rotate`, `V-Tilt` & `H-Tilt` straightening in Darkroom (zero AI distortion)
+- [x] **Hardware Flash, Continuous Torch & Front Screen Ring-Light Flash** — `Off / Auto / On / Torch` in top bar + warm soft-white screen ring flash for low-light selfies
+- [x] **Pro Video Quality & Mic Control** — Hardware-validated `1080p 30`, `1080p 60`, `4K 30` quality switcher + 1-tap Mic Mute toggle
+- [x] **Darkroom Undo/Redo, 1-Tap Share & Delete** — Full edit history stack, native Android Share Sheet export, and safe photo deletion
+
+---
+
+## Ideas Brainstorm (Inspired by Halide, Leica LUX, Blackmagic Camera, Dazz Cam & ProCamera)
+
+- [x] **Retro Film Date Stamp (`'98 Film` & `Minimal`)** — Classic glowing orange quartz analog date stamp (`'26 11 26`) selectable live in Camera Tools and non-destructively in Darkroom
+- [x] **Polaroid / Museum / Cinema Export Frames with Real EXIF Specs** — Warm instant-film Polaroid border, Museum White, or Cinema Dark mat showing real camera specs (`24mm • f/1.8 • 1/250s • ISO 100`)
+- [x] **Hands-Free Voice & Open-Hand Shutter** — Say *"Capture"* / *"Cheese"* or raise an open hand to trigger capture hands-free (SpeechRecognizer + offline ML Kit Pose Detection)
+- [ ] **Split Focus & Exposure Reticles (ProCamera)** — Drag a circle for Focus and a separate square for Exposure Metering independently on the viewfinder
+- [ ] **Batch Copy & Paste Edit Recipes in Gallery** — Grade one photo from a shoot in Darkroom, copy its recipe, and apply it to 10+ photos at once
+- [x] **Cinema 180° Shutter Angle Option** — Auto-locks video shutter speed to `1/(2×FPS)` for natural cinema motion blur
+- [x] **Dual-Camera Reaction Mode (`DUAL`)** — Draggable Split dividing line (`20%–80%`) + Phone-Call draggable floating PiP card + `Swap` + hardware concurrent Camera2 with seamless sequential fallback
+- [ ] **Interactive Darkroom Crop & Aspect Ratio Export** — Actually crop exported photos to `4:5`, `1:1`, `3:2`, `16:9`, or `XPan` inside Darkroom while keeping the original full-sensor file untouched
+- [ ] **EXIF Photo Inspector Sheet** — Tap an info icon in Darkroom/Gallery to view exact lens focal length, ISO, shutter speed, resolution, color space, and file size
+- [x] **Quick Gestural Exposure Swipe (Halide)** — Swipe up/down anywhere on the live viewfinder to smoothly dial brightness with an auto-fading EV indicator pill

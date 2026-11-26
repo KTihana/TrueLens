@@ -21,13 +21,21 @@ enum class CaptureFormat(val badge: String, val description: String) {
 enum class ShootingMode(val label: String) {
     PHOTO("PHOTO"),
     VIDEO("VIDEO"),
+    DUAL("DUAL"),
     SLOW_MO("SLOW-MO"),
-    STOP_MO("STOP-MO"),
-    LONG_EXP("BULB"),
-    SUPER_MACRO("MACRO"),
-    PANORAMA("PANO"),
-    TIMELAPSE("TIMELAPSE"),
-    SCAN_DOC("SCAN")
+    STOP_MO("STOP MOTION"),
+    LONG_EXP("LONG EXPOSURE"),
+    SUPER_MACRO("SUPER MACRO"),
+    PANORAMA("PANORAMA"),
+    TIMELAPSE("TIME-LAPSE"),
+    SCAN_DOC("SCAN DOC")
+}
+
+enum class HandsFreeMode(val label: String) {
+    OFF("Off"),
+    VOICE("Voice"),
+    HAND("Palm"),
+    BOTH("Voice+Palm")
 }
 
 enum class StabilizerMode(val label: String, val description: String) {
@@ -75,6 +83,19 @@ enum class GridOverlay(val label: String) {
     CROSSHAIR("Cross")
 }
 
+enum class FlashMode(val label: String) {
+    OFF("Off"),
+    AUTO("Auto"),
+    ON("On"),
+    TORCH("Torch")
+}
+
+enum class VideoQuality(val label: String, val targetWidth: Int, val targetHeight: Int, val targetFps: Int, val bitRate: Int) {
+    FHD_30("1080p 30", 1920, 1080, 30, 16_000_000),
+    FHD_60("1080p 60", 1920, 1080, 60, 24_000_000),
+    UHD_30("4K 30", 3840, 2160, 30, 42_000_000)
+}
+
 data class LensInfo(
     val cameraId: String,
     val isFront: Boolean,
@@ -110,8 +131,8 @@ data class ManualSettings(
     val aeAfLocked: Boolean = false,
     val focusPeaking: Boolean = false,
     val zebras: Boolean = false,
-    val histogram: Boolean = true,
-    val levelGauge: Boolean = true,
+    val histogram: Boolean = false,
+    val levelGauge: Boolean = false,
     val gridOverlay: GridOverlay = GridOverlay.RULE_OF_THIRDS,
     val timerDuration: TimerDuration = TimerDuration.OFF,
     val soloBurstCount: SoloBurstCount = SoloBurstCount.SINGLE,
@@ -122,7 +143,14 @@ data class ManualSettings(
     val mirrorFrontSave: Boolean = false,
     val macroFocusStackEnabled: Boolean = false,
     val splitScreenEnabled: Boolean = false,
-    val friendMode: Boolean = false
+    val friendMode: Boolean = false,
+    val flashMode: FlashMode = FlashMode.OFF,
+    val videoQuality: VideoQuality = VideoQuality.FHD_30,
+    val micMuted: Boolean = false,
+    val cinema180Shutter: Boolean = false,
+    val dateStampStyle: com.truelens.camera.grading.DateStampStyle = com.truelens.camera.grading.DateStampStyle.OFF,
+    val handsFreeMode: HandsFreeMode = HandsFreeMode.OFF,
+    val dualLayout: com.truelens.camera.grading.DualCameraLayout = com.truelens.camera.grading.DualCameraLayout.SPLIT
 )
 
 data class LiveTelemetry(

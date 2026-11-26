@@ -11,8 +11,8 @@ android {
     applicationId = "com.truelens.camera"
     minSdk = 29
     targetSdk = 36
-    versionCode = 2
-    versionName = "1.1"
+    versionCode = 3
+    versionName = "2.0"
   }
 
   buildTypes {
@@ -63,6 +63,7 @@ dependencies {
   implementation(libs.androidx.compose.material3)
   implementation(libs.androidx.compose.material.icons.extended)
   implementation(libs.mlkit.subject.segmentation)
+  implementation("com.google.mlkit:pose-detection:18.0.0-beta5")
   // Tooling
   debugImplementation(libs.androidx.compose.ui.tooling)
   // Instrumented tests

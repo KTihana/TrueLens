@@ -194,6 +194,8 @@ class TrueLensCameraEngine(
                     )
                 )
             }
+            // Rear lenses sorted wide -> tele, then front camera
+            lenses.sortWith(compareBy<LensInfo> { it.isFront }.thenBy { it.focalLengthMm })
         } catch (e: Exception) {
             Log.e(TAG, "Error enumerating lenses", e)
             onError("Could not enumerate cameras: ${e.message}")
@@ -306,8 +308,9 @@ class TrueLensCameraEngine(
                         val memCb = pendingMemoryFrameCallback
                         if (memCb != null) {
                             pendingMemoryFrameCallback = null
+                            val mirrorFront = lens.isFront && currentSettings.mirrorFrontSave
                             ioExecutor.execute {
-                                val bmp = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+                                val bmp = decodeJpegWithExifOrientation(bytes, mirrorHorizontal = mirrorFront)
                                 memCb(bmp)
                             }
                         } else {
@@ -380,18 +383,27 @@ class TrueLensCameraEngine(
         val surface = previewSurface ?: return
 
         try {
+            // Map portrait screen (normX, normY) into exact rotated sensor activeArraySize coordinates
+            val nx = normX.coerceIn(0f, 1f)
+            val ny = normY.coerceIn(0f, 1f)
+            val adjX = if (lens.isFront) 1f - nx else nx
+            val (sensorNormX, sensorNormY) = when (lens.sensorOrientation) {
+                90 -> ny to (1f - adjX)
+                180 -> (1f - adjX) to (1f - ny)
+                270 -> (1f - ny) to adjX
+                else -> adjX to ny
+            }
+
             val activeRect = lens.activeArraySize
-            val cx = (normX.coerceIn(0f, 1f) * activeRect.width()).toInt()
-            val cy = (normY.coerceIn(0f, 1f) * activeRect.height()).toInt()
+            val cx = (sensorNormX.coerceIn(0f, 1f) * activeRect.width()).toInt()
+            val cy = (sensorNormY.coerceIn(0f, 1f) * activeRect.height()).toInt()
             val halfW = (activeRect.width() * 0.08f).toInt()
             val halfH = (activeRect.height() * 0.08f).toInt()
-            val region = MeteringRectangle(
-                (cx - halfW).coerceAtLeast(0),
-                (cy - halfH).coerceAtLeast(0),
-                (halfW * 2).coerceAtMost(activeRect.width()),
-                (halfH * 2).coerceAtMost(activeRect.height()),
-                MeteringRectangle.METERING_WEIGHT_MAX
-            )
+            val left = (cx - halfW).coerceIn(0, (activeRect.width() - 2).coerceAtLeast(0))
+            val top = (cy - halfH).coerceIn(0, (activeRect.height() - 2).coerceAtLeast(0))
+            val w = (halfW * 2).coerceAtMost(activeRect.width() - left).coerceAtLeast(1)
+            val h = (halfH * 2).coerceAtMost(activeRect.height() - top).coerceAtLeast(1)
+            val region = MeteringRectangle(left, top, w, h, MeteringRectangle.METERING_WEIGHT_MAX)
 
             val builder = device.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW)
             builder.addTarget(surface)
@@ -421,13 +433,32 @@ class TrueLensCameraEngine(
         val chars = activeCharacteristics
 
         try {
-            // Detect highest supported Slow-Mo FPS if requested (e.g. 120fps / 240fps)
-            var captureFps = 30
-            var videoWidth = 1920
-            var videoHeight = 1080
-            if (isSlowMo && chars != null) {
-                val map = chars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
-                val hsRanges = map?.highSpeedVideoFpsRanges
+            // Pick a hardware-supported MediaRecorder size matching chosen VideoQuality (graceful fallback)
+            var captureFps = settings.videoQuality.targetFps
+            var videoWidth = 1280
+            var videoHeight = 720
+            val map = chars?.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+            val recorderSizes = map?.getOutputSizes(MediaRecorder::class.java)
+            val requestedW = settings.videoQuality.targetWidth
+            val requestedH = settings.videoQuality.targetHeight
+            val standardChosen = recorderSizes?.firstOrNull { it.width == requestedW && it.height == requestedH }
+                ?: recorderSizes?.firstOrNull { it.width == 1920 && it.height == 1080 }
+                ?: recorderSizes?.firstOrNull { it.width == 1280 && it.height == 720 }
+                ?: recorderSizes?.filter { it.width <= 1920 && it.height <= 1080 }
+                    ?.maxByOrNull { it.width.toLong() * it.height.toLong() }
+            if (standardChosen != null) {
+                videoWidth = standardChosen.width
+                videoHeight = standardChosen.height
+            }
+            // Validate 60fps against camera AE target FPS ranges so unsupported hardware falls back cleanly to 30fps
+            if (!isSlowMo && captureFps > 30) {
+                val fpsRanges = chars?.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES)
+                val supports60 = fpsRanges?.any { it.upper >= 60 } == true
+                if (!supports60) captureFps = 30
+            }
+
+            if (isSlowMo && map != null) {
+                val hsRanges = map.highSpeedVideoFpsRanges
                 val bestRange = hsRanges?.maxByOrNull { it.upper }
                 if (bestRange != null && bestRange.upper >= 120) {
                     captureFps = bestRange.upper.coerceAtMost(240)
@@ -440,7 +471,6 @@ class TrueLensCameraEngine(
                         videoHeight = chosen.height
                     }
                 } else {
-                    // Graceful 60->30 (2x) slow-mo fallback on devices without high-speed stream
                     captureFps = 60
                 }
             }
@@ -451,6 +481,7 @@ class TrueLensCameraEngine(
                 put(MediaStore.Video.Media.DISPLAY_NAME, "${prefix}_$stamp.mp4")
                 put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
                 put(MediaStore.Video.Media.RELATIVE_PATH, "${Environment.DIRECTORY_MOVIES}/TrueLens")
+                put(MediaStore.Video.Media.IS_PENDING, 1)
             }
             val uri = context.contentResolver.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, values)
                 ?: return onFailed("Could not create video file")
@@ -464,21 +495,23 @@ class TrueLensCameraEngine(
                 MediaRecorder()
             }
 
-            if (hasAudioPermission && !isSlowMo) {
+            val recordAudio = hasAudioPermission && !isSlowMo && !settings.micMuted
+            if (recordAudio) {
                 recorder.setAudioSource(MediaRecorder.AudioSource.MIC)
             }
             recorder.setVideoSource(MediaRecorder.VideoSource.SURFACE)
             recorder.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
             recorder.setOutputFile(pfd.fileDescriptor)
             recorder.setVideoEncoder(MediaRecorder.VideoEncoder.H264)
-            if (hasAudioPermission && !isSlowMo) {
+            if (recordAudio) {
                 recorder.setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
                 recorder.setAudioEncodingBitRate(128_000)
                 recorder.setAudioSamplingRate(44_100)
             }
-            recorder.setVideoEncodingBitRate(if (isSlowMo) 24_000_000 else 16_000_000)
+            val bitrate = if (isSlowMo) 24_000_000 else settings.videoQuality.bitRate
+            recorder.setVideoEncodingBitRate(bitrate)
             recorder.setVideoSize(videoWidth, videoHeight)
-            recorder.setVideoFrameRate(30) // Playback at smooth 30fps
+            recorder.setVideoFrameRate(if (isSlowMo) 30 else captureFps)
             if (isSlowMo) {
                 recorder.setCaptureRate(captureFps.toDouble())
             }
@@ -506,6 +539,17 @@ class TrueLensCameraEngine(
                             req.addTarget(preview)
                             req.addTarget(recSurface)
                             applyRequestParameters(req, settings)
+                            // Cinema 180° Shutter Angle Rule: lock shutter to 1/(2 * fps) for natural cinema motion blur
+                            if (!isSlowMo && settings.cinema180Shutter && lens.supportsManualSensor) {
+                                val cinemaShutterNs = (1_000_000_000L / (2L * captureFps.coerceAtLeast(24)))
+                                    .coerceIn(lens.exposureTimeRangeNs.lower, lens.exposureTimeRangeNs.upper)
+                                req.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_OFF)
+                                req.set(CaptureRequest.SENSOR_EXPOSURE_TIME, cinemaShutterNs)
+                                req.set(
+                                    CaptureRequest.SENSOR_SENSITIVITY,
+                                    (settings.iso ?: 250).coerceIn(lens.isoRange.lower, lens.isoRange.upper)
+                                )
+                            }
                             // Enable hardware OIS + EIS stabilization whenever Stabilizer != OFF
                             if (settings.stabilizerMode != StabilizerMode.OFF) {
                                 req.set(
@@ -524,7 +568,9 @@ class TrueLensCameraEngine(
                             session.setRepeatingRequest(req.build(), null, backgroundHandler)
                             recorder.start()
                             isRecordingVideo = true
-                            val label = if (isSlowMo) "${captureFps}fps → 30fps" else "1080p 30fps"
+                            val resLabel = if (videoWidth >= 3800) "4K" else "${videoHeight}p"
+                            val angleTag = if (!isSlowMo && settings.cinema180Shutter) " • 180°" else ""
+                            val label = if (isSlowMo) "${captureFps}fps → 30fps" else "$resLabel ${captureFps}fps$angleTag"
                             onStarted(label)
                         } catch (e: Exception) {
                             Log.e(TAG, "Failed to start MediaRecorder", e)
@@ -560,6 +606,13 @@ class TrueLensCameraEngine(
             }
         }
         cleanupRecorder()
+        if (savedUri != null) {
+            try {
+                val done = ContentValues().apply { put(MediaStore.Video.Media.IS_PENDING, 0) }
+                context.contentResolver.update(savedUri, done, null, null)
+            } catch (_: Exception) {
+            }
+        }
         createCaptureSession()
         onSaved(savedUri)
     }
@@ -736,6 +789,7 @@ class TrueLensCameraEngine(
             (settings.exposureMode == ExposureMode.MANUAL_M ||
                 (settings.exposureMode == ExposureMode.SHUTTER_TV && settings.shutterSpeedNs != null))
 
+        val hasFlashUnit = activeCharacteristics?.get(CameraCharacteristics.FLASH_INFO_AVAILABLE) == true
         if (isManualExposure) {
             builder.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_OFF)
             val targetIso = (settings.iso ?: 200).coerceIn(lens.isoRange.lower, lens.isoRange.upper)
@@ -744,8 +798,32 @@ class TrueLensCameraEngine(
             builder.set(CaptureRequest.SENSOR_SENSITIVITY, targetIso)
             builder.set(CaptureRequest.SENSOR_EXPOSURE_TIME, targetExp)
             builder.set(CaptureRequest.SENSOR_FRAME_DURATION, maxOf(targetExp, 16_666_666L))
+            if (hasFlashUnit) {
+                builder.set(
+                    CaptureRequest.FLASH_MODE,
+                    if (settings.flashMode == FlashMode.TORCH) CaptureRequest.FLASH_MODE_TORCH
+                    else if (settings.flashMode == FlashMode.ON) CaptureRequest.FLASH_MODE_SINGLE
+                    else CaptureRequest.FLASH_MODE_OFF
+                )
+            }
         } else {
-            builder.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
+            val aeMode = if (hasFlashUnit) {
+                when (settings.flashMode) {
+                    FlashMode.AUTO -> CaptureRequest.CONTROL_AE_MODE_ON_AUTO_FLASH
+                    FlashMode.ON -> CaptureRequest.CONTROL_AE_MODE_ON_ALWAYS_FLASH
+                    FlashMode.TORCH, FlashMode.OFF -> CaptureRequest.CONTROL_AE_MODE_ON
+                }
+            } else {
+                CaptureRequest.CONTROL_AE_MODE_ON
+            }
+            builder.set(CaptureRequest.CONTROL_AE_MODE, aeMode)
+            if (hasFlashUnit) {
+                builder.set(
+                    CaptureRequest.FLASH_MODE,
+                    if (settings.flashMode == FlashMode.TORCH) CaptureRequest.FLASH_MODE_TORCH
+                    else CaptureRequest.FLASH_MODE_OFF
+                )
+            }
             builder.set(CaptureRequest.CONTROL_AE_LOCK, settings.aeAfLocked)
             val clampedEv = settings.evCompensationSteps.coerceIn(
                 lens.aeCompensationRange.lower,
@@ -806,12 +884,14 @@ class TrueLensCameraEngine(
         val chars = activeCharacteristics
         val lens = activeLens ?: return
         val grade = pendingCaptureGrade
+        val lut = pendingCaptureLut
         val settings = pendingCaptureSettings
 
         // Reset pending state
         pendingRawImage = null
         pendingJpegBytes = null
         pendingCaptureResult = null
+        pendingCaptureLut = null
 
         ioExecutor.execute {
             val timestamp = System.currentTimeMillis()
@@ -829,42 +909,29 @@ class TrueLensCameraEngine(
                     }
                 }
 
-                // 2. Save Clean / Graded JPEG (with optional Front-Camera Mirror-Save & .cube LUT)
+                // 2. Save Clean / Graded JPEG (with EXIF orientation + optional Mirror-Save, .cube LUT & Analog Date Stamp)
                 if (jpegBytes != null) {
-                    val needTransform = !grade.isNeutral || pendingCaptureLut != null ||
-                        (lens.isFront && settings.mirrorFrontSave)
+                    val hasDateStamp = settings.dateStampStyle != com.truelens.camera.grading.DateStampStyle.OFF
+                    val needTransform = !grade.isNeutral || lut != null ||
+                        (lens.isFront && settings.mirrorFrontSave) || hasDateStamp
                     val finalBytes = if (needTransform) {
-                        val decoded = BitmapFactory.decodeByteArray(jpegBytes, 0, jpegBytes.size)
-                        if (decoded != null) {
-                            // Respect EXIF orientation before re-encoding so graded/mirrored photos never rotate sideways
-                            val exifRot = try {
-                                when (ExifInterface(ByteArrayInputStream(jpegBytes)).getAttributeInt(
-                                    ExifInterface.TAG_ORIENTATION,
-                                    ExifInterface.ORIENTATION_NORMAL
-                                )) {
-                                    ExifInterface.ORIENTATION_ROTATE_90 -> 90f
-                                    ExifInterface.ORIENTATION_ROTATE_180 -> 180f
-                                    ExifInterface.ORIENTATION_ROTATE_270 -> 270f
-                                    else -> 0f
-                                }
-                            } catch (_: Exception) {
-                                0f
-                            }
-                            val m = Matrix()
-                            if (exifRot != 0f) m.postRotate(exifRot)
-                            if (lens.isFront && settings.mirrorFrontSave) m.postScale(-1f, 1f)
-                            val oriented = if (!m.isIdentity) {
-                                Bitmap.createBitmap(decoded, 0, 0, decoded.width, decoded.height, m, true).also {
-                                    decoded.recycle()
-                                }
-                            } else {
-                                decoded
-                            }
-                            val graded = BitmapGrader.applyGrade(oriented, grade, pendingCaptureLut)
+                        val oriented = decodeJpegWithExifOrientation(
+                            jpegBytes,
+                            mirrorHorizontal = lens.isFront && settings.mirrorFrontSave
+                        )
+                        if (oriented != null) {
+                            val graded = BitmapGrader.applyGrade(oriented, grade, lut)
                             oriented.recycle()
+                            val stamped = if (hasDateStamp) {
+                                com.truelens.camera.grading.PhotoFrameRenderer.applyDateStamp(
+                                    graded, settings.dateStampStyle, timestamp
+                                ).also { if (it !== graded) graded.recycle() }
+                            } else {
+                                graded
+                            }
                             val out = ByteArrayOutputStream()
-                            graded.compress(Bitmap.CompressFormat.JPEG, 96, out)
-                            graded.recycle()
+                            stamped.compress(Bitmap.CompressFormat.JPEG, 96, out)
+                            stamped.recycle()
                             out.toByteArray()
                         } else {
                             jpegBytes
@@ -901,6 +968,33 @@ class TrueLensCameraEngine(
                 Log.e(TAG, "Error saving capture", e)
                 onError("Save failed: ${e.message}")
             }
+        }
+    }
+
+    private fun decodeJpegWithExifOrientation(bytes: ByteArray, mirrorHorizontal: Boolean): Bitmap? {
+        val decoded = BitmapFactory.decodeByteArray(bytes, 0, bytes.size) ?: return null
+        val exifRot = try {
+            when (ExifInterface(ByteArrayInputStream(bytes)).getAttributeInt(
+                ExifInterface.TAG_ORIENTATION,
+                ExifInterface.ORIENTATION_NORMAL
+            )) {
+                ExifInterface.ORIENTATION_ROTATE_90 -> 90f
+                ExifInterface.ORIENTATION_ROTATE_180 -> 180f
+                ExifInterface.ORIENTATION_ROTATE_270 -> 270f
+                else -> 0f
+            }
+        } catch (_: Exception) {
+            0f
+        }
+        val m = Matrix()
+        if (exifRot != 0f) m.postRotate(exifRot)
+        if (mirrorHorizontal) m.postScale(-1f, 1f)
+        return if (!m.isIdentity) {
+            Bitmap.createBitmap(decoded, 0, 0, decoded.width, decoded.height, m, true).also {
+                decoded.recycle()
+            }
+        } else {
+            decoded
         }
     }
 

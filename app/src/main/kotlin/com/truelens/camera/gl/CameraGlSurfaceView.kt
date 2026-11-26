@@ -1,6 +1,7 @@
 package com.truelens.camera.gl
 
 import android.content.Context
+import android.graphics.Bitmap
 import android.opengl.GLSurfaceView
 import android.view.Surface
 import com.truelens.camera.grading.LightroomGrade
@@ -8,7 +9,8 @@ import com.truelens.camera.grading.LightroomGrade
 class CameraGlSurfaceView(
     context: Context,
     onSurfaceReady: (Surface) -> Unit,
-    onHistogramSampled: ((FloatArray) -> Unit)? = null
+    onHistogramSampled: ((FloatArray) -> Unit)? = null,
+    onPalmSampled: ((Bitmap) -> Unit)? = null
 ) : GLSurfaceView(context) {
 
     val renderer: LiveGradingRenderer
@@ -18,7 +20,8 @@ class CameraGlSurfaceView(
         renderer = LiveGradingRenderer(
             onSurfaceReady = onSurfaceReady,
             requestRenderCallback = { requestRender() },
-            onHistogramSampled = onHistogramSampled
+            onHistogramSampled = onHistogramSampled,
+            onPalmSampled = onPalmSampled
         )
         setRenderer(renderer)
         renderMode = RENDERMODE_WHEN_DIRTY

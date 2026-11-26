@@ -24,31 +24,36 @@ import kotlin.math.abs
 @Composable
 fun AspectRatioMaskOverlay(
     mask: AspectRatioMask,
+    frameScale: Pair<Float, Float> = 1f to 1f,
     modifier: Modifier = Modifier
 ) {
     val targetRatio = mask.widthOverHeight ?: return
     Canvas(modifier = modifier.fillMaxSize()) {
-        val screenRatio = size.width / size.height
+        val frameW = size.width * frameScale.first.coerceIn(0.1f, 1f)
+        val frameH = size.height * frameScale.second.coerceIn(0.1f, 1f)
+        val left = (size.width - frameW) / 2f
+        val top = (size.height - frameH) / 2f
+        val frameRatio = frameW / frameH
         val matteColor = Color.Black.copy(alpha = 0.68f)
         val borderColor = Color.White.copy(alpha = 0.45f)
         val stroke = 1.dp.toPx()
 
-        if (targetRatio > screenRatio) {
-            // Letterbox top & bottom (e.g. 4:5, 3:2, XPAN)
-            val cropH = size.width / targetRatio
-            val barH = ((size.height - cropH) / 2f).coerceAtLeast(0f)
-            drawRect(matteColor, Offset.Zero, Size(size.width, barH))
-            drawRect(matteColor, Offset(0f, size.height - barH), Size(size.width, barH))
-            drawLine(borderColor, Offset(0f, barH), Offset(size.width, barH), stroke)
-            drawLine(borderColor, Offset(0f, size.height - barH), Offset(size.width, size.height - barH), stroke)
+        if (targetRatio > frameRatio) {
+            // Letterbox top & bottom inside active camera frame
+            val cropH = frameW / targetRatio
+            val barH = ((frameH - cropH) / 2f).coerceAtLeast(0f)
+            drawRect(matteColor, Offset(left, top), Size(frameW, barH))
+            drawRect(matteColor, Offset(left, top + frameH - barH), Size(frameW, barH))
+            drawLine(borderColor, Offset(left, top + barH), Offset(left + frameW, top + barH), stroke)
+            drawLine(borderColor, Offset(left, top + frameH - barH), Offset(left + frameW, top + frameH - barH), stroke)
         } else {
-            // Pillarbox left & right
-            val cropW = size.height * targetRatio
-            val barW = ((size.width - cropW) / 2f).coerceAtLeast(0f)
-            drawRect(matteColor, Offset.Zero, Size(barW, size.height))
-            drawRect(matteColor, Offset(size.width - barW, 0f), Size(barW, size.height))
-            drawLine(borderColor, Offset(barW, 0f), Offset(barW, size.height), stroke)
-            drawLine(borderColor, Offset(size.width - barW, 0f), Offset(size.width - barW, size.height), stroke)
+            // Pillarbox left & right inside active camera frame
+            val cropW = frameH * targetRatio
+            val barW = ((frameW - cropW) / 2f).coerceAtLeast(0f)
+            drawRect(matteColor, Offset(left, top), Size(barW, frameH))
+            drawRect(matteColor, Offset(left + frameW - barW, top), Size(barW, frameH))
+            drawLine(borderColor, Offset(left + barW, top), Offset(left + barW, top + frameH), stroke)
+            drawLine(borderColor, Offset(left + frameW - barW, top), Offset(left + frameW - barW, top + frameH), stroke)
         }
     }
 }
@@ -56,32 +61,37 @@ fun AspectRatioMaskOverlay(
 @Composable
 fun CompositionGridOverlay(
     grid: GridOverlay,
+    frameScale: Pair<Float, Float> = 1f to 1f,
     modifier: Modifier = Modifier
 ) {
     if (grid == GridOverlay.NONE) return
     Canvas(modifier = modifier.fillMaxSize()) {
+        val frameW = size.width * frameScale.first.coerceIn(0.1f, 1f)
+        val frameH = size.height * frameScale.second.coerceIn(0.1f, 1f)
+        val left = (size.width - frameW) / 2f
+        val top = (size.height - frameH) / 2f
         val lineColor = Color.White.copy(alpha = 0.28f)
-        val stroke = 1.dp.toPx()
+        val stroke = 0.9.dp.toPx()
         when (grid) {
             GridOverlay.RULE_OF_THIRDS -> {
                 for (i in 1..2) {
-                    val x = size.width * i / 3f
-                    val y = size.height * i / 3f
-                    drawLine(lineColor, Offset(x, 0f), Offset(x, size.height), stroke)
-                    drawLine(lineColor, Offset(0f, y), Offset(size.width, y), stroke)
+                    val x = left + frameW * i / 3f
+                    val y = top + frameH * i / 3f
+                    drawLine(lineColor, Offset(x, top), Offset(x, top + frameH), stroke)
+                    drawLine(lineColor, Offset(left, y), Offset(left + frameW, y), stroke)
                 }
             }
             GridOverlay.GOLDEN_RATIO -> {
                 val r1 = 0.382f
                 val r2 = 0.618f
-                drawLine(lineColor, Offset(size.width * r1, 0f), Offset(size.width * r1, size.height), stroke)
-                drawLine(lineColor, Offset(size.width * r2, 0f), Offset(size.width * r2, size.height), stroke)
-                drawLine(lineColor, Offset(0f, size.height * r1), Offset(size.width, size.height * r1), stroke)
-                drawLine(lineColor, Offset(0f, size.height * r2), Offset(size.width, size.height * r2), stroke)
+                drawLine(lineColor, Offset(left + frameW * r1, top), Offset(left + frameW * r1, top + frameH), stroke)
+                drawLine(lineColor, Offset(left + frameW * r2, top), Offset(left + frameW * r2, top + frameH), stroke)
+                drawLine(lineColor, Offset(left, top + frameH * r1), Offset(left + frameW, top + frameH * r1), stroke)
+                drawLine(lineColor, Offset(left, top + frameH * r2), Offset(left + frameW, top + frameH * r2), stroke)
             }
             GridOverlay.CROSSHAIR -> {
-                val cx = size.width / 2f
-                val cy = size.height / 2f
+                val cx = left + frameW / 2f
+                val cy = top + frameH / 2f
                 val arm = 22.dp.toPx()
                 drawLine(lineColor, Offset(cx - arm, cy), Offset(cx + arm, cy), stroke * 1.5f)
                 drawLine(lineColor, Offset(cx, cy - arm), Offset(cx, cy + arm), stroke * 1.5f)
@@ -184,7 +194,7 @@ fun TapFocusReticle(
         val cx = normalizedPosition.x * size.width
         val cy = normalizedPosition.y * size.height
         val r = 28.dp.toPx()
-        val color = if (isLocked) Color(0xFF34D399) else Color(0xFFFFB300)
+        val color = if (isLocked) Color(0xFF34D399) else TrueLensPalette.AccentViolet
         val stroke = 1.8.dp.toPx()
         val corner = 9.dp.toPx()
 

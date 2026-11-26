@@ -132,8 +132,9 @@ class MainActivity : ComponentActivity() {
     // Tactile hardware shutter via Volume Up / Volume Down keys
     override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
         if (keyCode == KeyEvent.KEYCODE_VOLUME_UP || keyCode == KeyEvent.KEYCODE_VOLUME_DOWN) {
-            if (!cameraViewModel.uiState.value.isDarkroomOpen) {
-                cameraViewModel.capturePhoto()
+            val s = cameraViewModel.uiState.value
+            if (!s.isDarkroomOpen && !s.isGalleryOpen && !s.isPoseInsposOpen) {
+                cameraViewModel.onShutterPressed()
                 return true
             }
         }
@@ -175,6 +176,15 @@ class MainActivity : ComponentActivity() {
                     if (!uris.isNullOrEmpty()) cameraViewModel.handleSharedImages(uris)
                 }
             }
+        }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) ==
+            PackageManager.PERMISSION_GRANTED
+        ) {
+            cameraViewModel.resumeCameraIfNeeded()
         }
     }
 

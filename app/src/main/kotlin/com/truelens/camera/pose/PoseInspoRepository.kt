@@ -253,14 +253,6 @@ class PoseInspoRepository(private val context: Context) {
     }
 
     private fun decodeScaledBitmapFromUri(uri: Uri, maxDim: Int): Bitmap? {
-        val cr = context.contentResolver
-        val opts = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-        cr.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, opts) }
-        var sample = 1
-        while (opts.outWidth / sample > maxDim || opts.outHeight / sample > maxDim) {
-            sample *= 2
-        }
-        val decodeOpts = BitmapFactory.Options().apply { inSampleSize = sample }
-        return cr.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, decodeOpts) }
+        return com.truelens.camera.camera.ExifBitmapLoader.loadScaled(context, uri, maxDim)
     }
 }

@@ -1,5 +1,6 @@
 package com.truelens.camera.gl
 
+import android.graphics.Bitmap
 import android.graphics.SurfaceTexture
 import android.opengl.GLES11Ext
 import android.opengl.GLES20
@@ -21,7 +22,8 @@ import javax.microedition.khronos.opengles.GL10
 class LiveGradingRenderer(
     private val onSurfaceReady: (Surface) -> Unit,
     private val requestRenderCallback: () -> Unit,
-    private val onHistogramSampled: ((FloatArray) -> Unit)? = null
+    private val onHistogramSampled: ((FloatArray) -> Unit)? = null,
+    private val onPalmSampled: ((Bitmap) -> Unit)? = null
 ) : GLSurfaceView.Renderer {
 
     @Volatile var grade: LightroomGrade = LightroomGrade.NEUTRAL
@@ -35,13 +37,16 @@ class LiveGradingRenderer(
     @Volatile var stabScale: Float = 1.0f
     @Volatile var splitScreenPos: Float = -1f // -1 = off, 0..1 = live vertical Before/After divider
     @Volatile var histogramSamplingEnabled: Boolean = true
+    @Volatile var palmSamplingEnabled: Boolean = false
 
     @Volatile private var bufferWidth: Int = 1440
     @Volatile private var bufferHeight: Int = 1080
     @Volatile private var sensorOrientationDeg: Int = 90
     @Volatile private var pendingBufferResize: Boolean = false
     private var lastHistogramSampleMs: Long = 0L
+    private var lastPalmSampleMs: Long = 0L
     private var histReadBuf: ByteBuffer? = null
+    private var palmReadBuf: ByteBuffer? = null
 
     private var programId: Int = 0
     private var oesTextureId: Int = 0
@@ -266,14 +271,61 @@ class LiveGradingRenderer(
         GLES20.glDisableVertexAttribArray(texLoc)
 
         // Lightweight GPU-rendered histogram sampling every 220ms (zero extra Camera2 stream!)
+        val now = System.currentTimeMillis()
         val histCb = onHistogramSampled
-        if (histogramSamplingEnabled && histCb != null) {
-            val now = System.currentTimeMillis()
-            if (now - lastHistogramSampleMs >= 220L) {
-                lastHistogramSampleMs = now
-                sampleRenderedHistogram(quadScale, histCb)
+        if (histogramSamplingEnabled && histCb != null && now - lastHistogramSampleMs >= 220L) {
+            lastHistogramSampleMs = now
+            sampleRenderedHistogram(quadScale, histCb)
+        }
+
+        // Lightweight GPU-rendered palm/hand gesture sampling (~3fps) ONLY when Hands-Free Palm mode is active
+        val palmCb = onPalmSampled
+        if (palmSamplingEnabled && palmCb != null && now - lastPalmSampleMs >= 320L) {
+            lastPalmSampleMs = now
+            samplePalmBitmap(quadScale, palmCb)
+        }
+    }
+
+    private fun samplePalmBitmap(
+        quadScale: AspectRatioMath.QuadScale,
+        callback: (Bitmap) -> Unit
+    ) {
+        val drawW = (viewportW * quadScale.scaleX).toInt().coerceAtLeast(1)
+        val drawH = (viewportH * quadScale.scaleY).toInt().coerceAtLeast(1)
+        val startX = ((viewportW - drawW) / 2).coerceAtLeast(0)
+        val startY = ((viewportH - drawH) / 2).coerceAtLeast(0)
+        val readW = drawW.coerceAtMost(viewportW - startX)
+        val readH = drawH.coerceAtMost(viewportH - startY)
+        if (readW < 64 || readH < 64) return
+
+        // Downsample 4x on readback into a crisp ~270x360 upright bitmap for ML Kit Pose Detection
+        val step = (maxOf(readW, readH) / 280).coerceAtLeast(1)
+        val outW = (readW / step).coerceAtLeast(1)
+        val outH = (readH / step).coerceAtLeast(1)
+
+        val needed = readW * readH * 4
+        val buf = if (palmReadBuf != null && palmReadBuf!!.capacity() >= needed) {
+            palmReadBuf!!
+        } else {
+            ByteBuffer.allocateDirect(needed).order(ByteOrder.nativeOrder()).also { palmReadBuf = it }
+        }
+        buf.position(0)
+        GLES20.glReadPixels(startX, startY, readW, readH, GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, buf)
+
+        val pixels = IntArray(outW * outH)
+        for (oy in 0 until outH) {
+            val srcY = (readH - 1 - oy * step).coerceIn(0, readH - 1)
+            val rowOff = srcY * readW * 4
+            for (ox in 0 until outW) {
+                val off = rowOff + (ox * step).coerceIn(0, readW - 1) * 4
+                val r = buf.get(off).toInt() and 0xFF
+                val g = buf.get(off + 1).toInt() and 0xFF
+                val b = buf.get(off + 2).toInt() and 0xFF
+                pixels[oy * outW + ox] = (0xFF shl 24) or (r shl 16) or (g shl 8) or b
             }
         }
+        val bmp = Bitmap.createBitmap(pixels, outW, outH, Bitmap.Config.ARGB_8888)
+        callback(bmp)
     }
 
     private fun sampleRenderedHistogram(

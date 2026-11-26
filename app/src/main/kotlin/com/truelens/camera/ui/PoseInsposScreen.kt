@@ -4,6 +4,7 @@ import android.content.Intent
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.net.Uri
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
@@ -76,9 +77,9 @@ import com.truelens.camera.pose.PoseInspoItem
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 
-private val InspoBg = Color(0xFF08080A)
-private val InspoCard = Color(0xFF14161C)
-private val InspoAmber = Color(0xFFFFB300)
+private val InspoBg = TrueLensPalette.Obsidian
+private val InspoCard = TrueLensPalette.SurfaceDark
+private val InspoAmber = TrueLensPalette.AccentViolet
 private val PinterestRed = Color(0xFFE60023)
 
 @Composable
@@ -101,6 +102,7 @@ fun PoseInsposScreen(
     onSelectPoseForOverlay: (PoseInspoItem) -> Unit,
     onDeletePoseItem: (folderId: String, itemId: String) -> Unit
 ) {
+    BackHandler(onBack = onClose)
     val activeFolder = folders.firstOrNull { it.id == selectedFolderId } ?: folders.firstOrNull()
     var showNewFolderDialog by remember { mutableStateOf(false) }
     var showPinterestDialog by remember { mutableStateOf(false) }
@@ -141,17 +143,16 @@ fun PoseInsposScreen(
                 }
                 Column {
                     Text(
-                        text = "POSE INSPOS",
+                        text = "Pose Inspos",
                         color = Color.White,
-                        fontSize = 14.sp,
-                        fontWeight = FontWeight.Bold,
-                        fontFamily = FontFamily.Monospace,
+                        fontSize = 17.sp,
+                        fontWeight = FontWeight.SemiBold,
                         maxLines = 1
                     )
                     Text(
                         text = "Tap any pose to overlay",
-                        color = Color(0xFFA0A4AE),
-                        fontSize = 10.sp,
+                        color = TrueLensPalette.MutedGray,
+                        fontSize = 11.sp,
                         maxLines = 1
                     )
                 }
@@ -177,15 +178,14 @@ fun PoseInsposScreen(
                         Icon(
                             imageVector = Icons.Default.AddPhotoAlternate,
                             contentDescription = "Gallery",
-                            tint = Color.Black,
+                            tint = Color.White,
                             modifier = Modifier.size(14.dp)
                         )
                         Text(
-                            text = " GALLERY",
-                            color = Color.Black,
-                            fontSize = 10.sp,
-                            fontWeight = FontWeight.Bold,
-                            fontFamily = FontFamily.Monospace,
+                            text = " Gallery",
+                            color = Color.White,
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.SemiBold,
                             maxLines = 1,
                             softWrap = false
                         )
