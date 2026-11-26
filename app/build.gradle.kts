@@ -17,7 +17,12 @@ android {
 
   buildTypes {
     release {
-      isMinifyEnabled = false
+      isMinifyEnabled = true
+      isShrinkResources = true
+      signingConfig = signingConfigs.getByName("debug")
+      ndk {
+        abiFilters += listOf("arm64-v8a")
+      }
       proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
     }
   }
@@ -33,6 +38,9 @@ android {
   }
 
   packaging {
+    jniLibs {
+      useLegacyPackaging = true
+    }
     resources {
       excludes += "/META-INF/{AL2.0,LGPL2.1}"
     }
