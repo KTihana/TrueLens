@@ -87,6 +87,7 @@ data class CameraUiState(
     val bypassLiveGrade: Boolean = false,
     val lastCapturedPhoto: CapturedPhoto? = null,
     val lastThumbnail: Bitmap? = null,
+    val lastThumbnailIsVideo: Boolean = false,
     val showShutterFlash: Boolean = false,
     val showFrontScreenFlash: Boolean = false,
     val statusBanner: String? = null,
@@ -177,14 +178,34 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
     private var timeLapseJob: Job? = null
     private var timerJob: Job? = null
     private var videoTimerJob: Job? = null
+    private var bannerJob: Job? = null
+    private var darkroomPreviewJob: Job? = null
     private val canonSlotPrefs = application.getSharedPreferences("truelens_canon_slots", Context.MODE_PRIVATE)
 
     init {
         loadPoseFolders()
+        refreshLatestThumbnail()
         viewModelScope.launch {
             val saved = customPresetRepo.loadCustomPresets()
             val slots = setOf("C1", "C2", "C3").filter { canonSlotPrefs.contains("${it}_mode") }.toSet()
             _uiState.update { it.copy(customPresets = saved, savedCanonSlots = slots) }
+        }
+    }
+
+    fun refreshLatestThumbnail() {
+        viewModelScope.launch {
+            val latest = queryTrueLensGallery(getApplication(), includeVideos = true).firstOrNull()
+            if (latest == null) {
+                _uiState.update { it.copy(lastThumbnail = null, lastThumbnailIsVideo = false) }
+            } else {
+                val thumb = loadMediaThumbnail(getApplication(), latest.uri, latest.isVideo, 240)
+                _uiState.update {
+                    it.copy(
+                        lastThumbnail = thumb ?: it.lastThumbnail,
+                        lastThumbnailIsVideo = latest.isVideo
+                    )
+                }
+            }
         }
     }
 
@@ -204,19 +225,14 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
                     it.copy(
                         lastCapturedPhoto = photo,
                         lastThumbnail = thumb ?: it.lastThumbnail,
-                        statusBanner = "Saved ${photo.formatBadge} • ISO ${photo.iso}"
+                        lastThumbnailIsVideo = if (thumb != null) false else it.lastThumbnailIsVideo
                     )
                 }
-                delay(2400)
-                _uiState.update { it.copy(statusBanner = null) }
+                showBanner("Saved ${photo.formatBadge} • ISO ${photo.iso}")
             }
         },
         onError = { msg ->
-            viewModelScope.launch {
-                _uiState.update { it.copy(statusBanner = msg) }
-                delay(3000)
-                _uiState.update { it.copy(statusBanner = null) }
-            }
+            showBanner(msg)
         }
     )
 
@@ -265,6 +281,7 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     fun resumeCameraIfNeeded() {
+        syncHandsFreeControllers()
         val surface = previewSurface ?: return
         if (!surface.isValid) return
         val lens = _uiState.value.activeLens ?: return
@@ -327,6 +344,7 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     fun setShootingMode(mode: ShootingMode) {
+        if (_uiState.value.isVideoRecording) stopVideoRecording()
         if (_uiState.value.timeLapseState.isRunning) stopTimeLapse()
         if (_uiState.value.panoramaState.isCapturing) cancelPanorama()
         if (mode != ShootingMode.DUAL) {
@@ -609,11 +627,26 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     private fun stopVideoRecording() {
+        val elapsed = _uiState.value.videoElapsedSec
         videoTimerJob?.cancel()
         videoTimerJob = null
         cameraEngine.stopVideoRecording { uri ->
             _uiState.update { it.copy(isVideoRecording = false, videoElapsedSec = 0) }
-            showBanner(if (uri != null) "Saved MP4 to Movies/TrueLens" else "Video save failed")
+            if (uri != null) {
+                viewModelScope.launch {
+                    // Brief settle delay so MediaStore finalizes video metadata before thumbnail load
+                    delay(180)
+                    val thumb = loadMediaThumbnail(getApplication(), uri, isVideo = true, maxDim = 240)
+                    if (thumb != null) {
+                        _uiState.update { it.copy(lastThumbnail = thumb, lastThumbnailIsVideo = true) }
+                    } else {
+                        refreshLatestThumbnail()
+                    }
+                }
+                showBanner("Saved MP4 to Movies/TrueLens")
+            } else {
+                showBanner(if (elapsed < 1) "Record at least 1 second to save video" else "Video save failed")
+            }
         }
     }
 
@@ -851,6 +884,12 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
                         )
                     )
                 }
+                val thumb = loadMediaThumbnail(getApplication(), uri, isVideo = true, maxDim = 240)
+                if (thumb != null) {
+                    _uiState.update { it.copy(lastThumbnail = thumb, lastThumbnailIsVideo = true) }
+                } else {
+                    refreshLatestThumbnail()
+                }
                 showBanner("Stop Motion MP4 (${framesCopy.size}f @ ${fps}fps) saved to Movies/TrueLens")
             } else {
                 _uiState.update { it.copy(stopMotionState = it.stopMotionState.copy(isExporting = false)) }
@@ -1001,10 +1040,17 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
                 showBanner("Compiling Time-Lapse MP4 (${framesCopy.size} frames @ 24fps)...")
                 val uri = StopMotionExporter.exportToMp4(getApplication(), framesCopy, 24, grade)
                 framesCopy.forEach { it.recycle() }
-                showBanner(
-                    if (uri != null) "Time-Lapse MP4 saved to Movies/TrueLens"
-                    else "Time-Lapse MP4 compile failed"
-                )
+                if (uri != null) {
+                    val thumb = loadMediaThumbnail(getApplication(), uri, isVideo = true, maxDim = 240)
+                    if (thumb != null) {
+                        _uiState.update { it.copy(lastThumbnail = thumb, lastThumbnailIsVideo = true) }
+                    } else {
+                        refreshLatestThumbnail()
+                    }
+                    showBanner("Time-Lapse MP4 saved to Movies/TrueLens")
+                } else {
+                    showBanner("Time-Lapse MP4 compile failed")
+                }
             }
         } else {
             framesCopy.forEach { it.recycle() }
@@ -1190,6 +1236,7 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     fun flipFrontBackCamera() {
+        if (_uiState.value.isVideoRecording) stopVideoRecording()
         val state = _uiState.value
         val active = state.activeLens ?: return
         val target = if (active.isFront) {
@@ -1201,14 +1248,17 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         if (target != null) {
             selectLens(target)
             _uiState.update { it.copy(zoomRatio = 1.0f) }
-            showBanner(if (target.isFront) "Front Camera (Pose Overlay Active)" else "Rear Camera (${target.displayLabel})")
+            showBanner(if (target.isFront) "Front Camera" else "Rear Camera (${target.displayLabel})")
         } else {
             showBanner("Only one camera available on this device")
         }
     }
 
     fun updateCameraZoom(zoomFactorDelta: Float) {
-        val next = (_uiState.value.zoomRatio * zoomFactorDelta).coerceIn(1.0f, 8.0f)
+        val lens = _uiState.value.activeLens
+        val minZ = lens?.minZoomRatio ?: 1.0f
+        val maxZ = lens?.maxZoomRatio ?: 8.0f
+        val next = (_uiState.value.zoomRatio * zoomFactorDelta).coerceIn(minZ, maxZ)
         _uiState.update { it.copy(zoomRatio = next) }
         cameraEngine.setZoom(next)
     }
@@ -1216,7 +1266,7 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
     /**
      * One-tap floating lens / zoom switcher (0.6, 1x, 2, 3 — matching modern flagship camera bars).
      * Automatically switches to a real physical Ultrawide/Main/Telephoto lens when present on the phone,
-     * and smoothly falls back to optical/digital zoom on 1x when a dedicated lens isn't present.
+     * OR uses Camera2 logical multi-camera CONTROL_ZOOM_RATIO (e.g. 0.6x ultrawide on API 30+ phones).
      */
     fun selectZoomStop(targetZoom: Float) {
         val state = _uiState.value
@@ -1239,11 +1289,11 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
             _uiState.update { it.copy(zoomRatio = 1.0f) }
             cameraEngine.setZoom(1.0f)
         } else {
-            // Switch to main 1x lens and apply clean zoom ratio (0.6 falls back to 1.0 if phone has no ultrawide)
+            // Switch to main 1x lens and apply optical/logical zoom (supports 0.6x if mainLens.minZoomRatio <= 0.6f!)
             if (mainLens.cameraId != state.activeLens?.cameraId) {
                 selectLens(mainLens)
             }
-            val safeZoom = targetZoom.coerceIn(1.0f, 8.0f)
+            val safeZoom = targetZoom.coerceIn(mainLens.minZoomRatio, mainLens.maxZoomRatio)
             _uiState.update { it.copy(zoomRatio = safeZoom) }
             cameraEngine.setZoom(safeZoom)
         }
@@ -1406,6 +1456,12 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
             delay(90)
             _uiState.update { it.copy(showShutterFlash = false) }
 
+            val origLens = _uiState.value.activeLens
+            // Ensure primary capture comes from Rear camera (if user happened to flip to Front before entering Dual)
+            if (origLens?.isFront == true && previewSurface != null) {
+                openLens(rearLens, previewSurface!!)
+                delay(650)
+            }
             // Step 1: Capture primary Rear frame
             val backBmp = captureSingleMemoryBitmap()
 
@@ -1417,13 +1473,14 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
 
             if (frontBmp == null && frontLens != null && previewSurface != null) {
                 showBanner("Capturing reaction...")
-                val origLens = _uiState.value.activeLens
                 openLens(frontLens, previewSurface!!)
                 delay(750)
                 frontBmp = captureSingleMemoryBitmap()
                 if (origLens != null && origLens.cameraId != frontLens.cameraId) {
                     openLens(origLens, previewSurface!!)
                 }
+            } else if (origLens != null && origLens.isFront && previewSurface != null) {
+                openLens(origLens, previewSurface!!)
             }
 
             if (backBmp != null) {
@@ -1469,7 +1526,7 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
                             cr.openOutputStream(uri)?.use { it.write(out.toByteArray()) }
                             val done = ContentValues().apply { put(MediaStore.Images.Media.IS_PENDING, 0) }
                             cr.update(uri, done, null, null)
-                            _uiState.update { it.copy(lastThumbnail = thumb) }
+                            _uiState.update { it.copy(lastThumbnail = thumb, lastThumbnailIsVideo = false) }
                         }
                         uri
                     } catch (_: Exception) {
@@ -1637,6 +1694,7 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
                     )
                 }
                 showBanner("Photo deleted")
+                refreshLatestThumbnail()
             } else {
                 showBanner("Could not delete photo")
             }
@@ -1646,25 +1704,7 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
     // --- BUILT-IN DARKROOM EDITOR ---
     fun openDarkroom() {
         val uri = _uiState.value.lastCapturedPhoto?.jpegUri ?: return
-        darkroomUndoStack.clear()
-        darkroomRedoStack.clear()
-        viewModelScope.launch {
-            val bmp = loadScaledBitmap(uri, 1280) ?: return@launch
-            _uiState.update {
-                it.copy(
-                    isDarkroomOpen = true,
-                    darkroomSourceUri = uri,
-                    darkroomSourceBitmap = bmp,
-                    darkroomGradedBitmap = bmp,
-                    darkroomGrade = LightroomGrade.NEUTRAL,
-                    darkroomVerticalTilt = 0f,
-                    darkroomHorizontalTilt = 0f,
-                    darkroomRotationDeg = 0f,
-                    canUndoDarkroom = false,
-                    canRedoDarkroom = false
-                )
-            }
-        }
+        openDarkroomForUri(uri)
     }
 
     fun closeDarkroom() {
@@ -1701,7 +1741,8 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
     private fun recomputeDarkroomPreview() {
         val state = _uiState.value
         val src = state.darkroomSourceBitmap ?: return
-        viewModelScope.launch(Dispatchers.Default) {
+        darkroomPreviewJob?.cancel()
+        darkroomPreviewJob = viewModelScope.launch(Dispatchers.Default) {
             val straightened = BitmapGrader.applyKeystonePerspective(
                 src,
                 state.darkroomVerticalTilt,
@@ -1764,17 +1805,21 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
                         put(MediaStore.Images.Media.DISPLAY_NAME, "TrueLens_Edit_$stamp.jpg")
                         put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
                         put(MediaStore.Images.Media.RELATIVE_PATH, "${Environment.DIRECTORY_PICTURES}/TrueLens")
+                        put(MediaStore.Images.Media.IS_PENDING, 1)
                     }
                     val cr = getApplication<Application>().contentResolver
                     val outUri = cr.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
                         ?: return@withContext false
                     cr.openOutputStream(outUri)?.use { it.write(out.toByteArray()) }
+                    val done = ContentValues().apply { put(MediaStore.Images.Media.IS_PENDING, 0) }
+                    cr.update(outUri, done, null, null)
                     true
                 } catch (_: Exception) {
                     false
                 }
             }
             _uiState.update { it.copy(isExportingDarkroom = false) }
+            if (success) refreshLatestThumbnail()
             showBanner(if (success) "Exported graded photo to Pictures/TrueLens" else "Export failed")
         }
     }
@@ -1786,7 +1831,8 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     private fun showBanner(message: String) {
-        viewModelScope.launch {
+        bannerJob?.cancel()
+        bannerJob = viewModelScope.launch {
             _uiState.update { it.copy(statusBanner = message) }
             delay(2200)
             _uiState.update { it.copy(statusBanner = null) }

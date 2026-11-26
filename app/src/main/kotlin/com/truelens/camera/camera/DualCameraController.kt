@@ -73,6 +73,10 @@ class DualCameraController(private val context: Context) {
         }
     }
 
+    private var chosenBufferSize: Size = Size(640, 480)
+    private var secondarySensorOrientation: Int = 270
+    private var secondaryIsFront: Boolean = true
+
     @SuppressLint("MissingPermission")
     fun startSecondaryLive(
         frontCameraId: String,
@@ -90,7 +94,9 @@ class DualCameraController(private val context: Context) {
                 override fun onSurfaceTextureAvailable(surface: SurfaceTexture, width: Int, height: Int) {
                     openSecondaryDevice(frontCameraId, surface, width, height, onStateChanged)
                 }
-                override fun onSurfaceTextureSizeChanged(surface: SurfaceTexture, width: Int, height: Int) = Unit
+                override fun onSurfaceTextureSizeChanged(surface: SurfaceTexture, width: Int, height: Int) {
+                    applyCenterCropTransform(textureView, width, height)
+                }
                 override fun onSurfaceTextureDestroyed(surface: SurfaceTexture): Boolean {
                     stopSecondary()
                     return true
@@ -100,6 +106,33 @@ class DualCameraController(private val context: Context) {
         } else {
             openSecondaryDevice(frontCameraId, st, textureView.width, textureView.height, onStateChanged)
         }
+    }
+
+    /**
+     * Applies an exact 1:1 Center-Crop transform matrix onto the secondary TextureView so
+     * the reaction camera NEVER squishes or stretches at any Split ratio (20%-80%) or PiP size.
+     */
+    private fun applyCenterCropTransform(tv: TextureView, viewW: Int, viewH: Int) {
+        if (viewW <= 0 || viewH <= 0) return
+        val rotated = (secondarySensorOrientation % 180) != 0
+        val bufW = if (rotated) chosenBufferSize.height.toFloat() else chosenBufferSize.width.toFloat()
+        val bufH = if (rotated) chosenBufferSize.width.toFloat() else chosenBufferSize.height.toFloat()
+        if (bufW <= 0f || bufH <= 0f) return
+
+        val viewRatio = viewW.toFloat() / viewH.toFloat()
+        val bufRatio = bufW / bufH
+        val scaleX: Float
+        val scaleY: Float
+        if (bufRatio > viewRatio) {
+            scaleX = bufRatio / viewRatio
+            scaleY = 1f
+        } else {
+            scaleX = 1f
+            scaleY = viewRatio / bufRatio
+        }
+        val m = Matrix()
+        m.setScale(scaleX, scaleY, viewW / 2f, viewH / 2f)
+        tv.post { tv.setTransform(m) }
     }
 
     @SuppressLint("MissingPermission")
@@ -118,7 +151,11 @@ class DualCameraController(private val context: Context) {
                 ?: sizes?.firstOrNull { it.width == 960 && it.height == 720 }
                 ?: sizes?.filter { it.width <= 1280 && it.height <= 960 }?.maxByOrNull { it.width * it.height }
                 ?: Size(640, 480)
+            chosenBufferSize = chosen
+            secondarySensorOrientation = chars.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 270
+            secondaryIsFront = chars.get(CameraCharacteristics.LENS_FACING) == CameraCharacteristics.LENS_FACING_FRONT
             surfaceTexture.setDefaultBufferSize(chosen.width, chosen.height)
+            activeTextureView?.let { applyCenterCropTransform(it, viewW, viewH) }
             previewSurface = Surface(surfaceTexture)
 
             cameraManager.openCamera(

@@ -96,6 +96,7 @@ class TrueLensCameraEngine(
 
     // Video & Slow-Mo Recording state
     private var mediaRecorder: MediaRecorder? = null
+    private var recordingSurface: Surface? = null
     private var recordingPfd: ParcelFileDescriptor? = null
     private var recordingUri: Uri? = null
     private var isRecordingVideo: Boolean = false
@@ -116,9 +117,11 @@ class TrueLensCameraEngine(
                 }
             }
 
-            // Pick a reference "1x" focal length (typically median/standard rear lens)
-            val sortedRear = rearFocals.sortedBy { it.second }
-            val refFocal = sortedRear.firstOrNull()?.second ?: 4.0f
+            // Pick the primary "1x" reference focal length: prefer default back camera ("0" / first rear ID)
+            // rather than minimum focal length, so ultrawide lenses (<3mm) don't get mislabeled as "1x"!
+            val refFocal = rearFocals.firstOrNull { it.first == "0" }?.second
+                ?: rearFocals.firstOrNull()?.second
+                ?: 4.0f
 
             for (id in ids) {
                 val chars = cameraManager.getCameraCharacteristics(id)
@@ -171,6 +174,12 @@ class TrueLensCameraEngine(
                     }
                 }
 
+                val zoomRange = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                    chars.get(CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE)
+                } else null
+                val minZoom = (zoomRange?.lower ?: 1.0f).coerceAtLeast(0.5f)
+                val maxZoom = (zoomRange?.upper ?: 8.0f).coerceIn(1.0f, 12.0f)
+
                 lenses.add(
                     LensInfo(
                         cameraId = id,
@@ -190,7 +199,9 @@ class TrueLensCameraEngine(
                         previewSize = matchedPreview,
                         maxRawSize = maxRaw,
                         maxJpegSize = maxJpeg,
-                        displayLabel = label
+                        displayLabel = label,
+                        minZoomRatio = minZoom,
+                        maxZoomRatio = maxZoom
                     )
                 )
             }
@@ -372,7 +383,9 @@ class TrueLensCameraEngine(
     }
 
     fun setZoom(ratio: Float) {
-        this.zoomRatio = ratio.coerceIn(1.0f, 8.0f)
+        val minZ = activeLens?.minZoomRatio ?: 1.0f
+        val maxZ = activeLens?.maxZoomRatio ?: 8.0f
+        this.zoomRatio = ratio.coerceIn(minZ, maxZ)
         updateRepeatingPreview()
     }
 
@@ -405,8 +418,12 @@ class TrueLensCameraEngine(
             val h = (halfH * 2).coerceAtMost(activeRect.height() - top).coerceAtLeast(1)
             val region = MeteringRectangle(left, top, w, h, MeteringRectangle.METERING_WEIGHT_MAX)
 
-            val builder = device.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW)
+            val template = if (isRecordingVideo) CameraDevice.TEMPLATE_RECORD else CameraDevice.TEMPLATE_PREVIEW
+            val builder = device.createCaptureRequest(template)
             builder.addTarget(surface)
+            if (isRecordingVideo) {
+                recordingSurface?.takeIf { it.isValid }?.let { builder.addTarget(it) }
+            }
             applyRequestParameters(builder, currentSettings)
             builder.set(CaptureRequest.CONTROL_AF_REGIONS, arrayOf(region))
             builder.set(CaptureRequest.CONTROL_AE_REGIONS, arrayOf(region))
@@ -520,6 +537,7 @@ class TrueLensCameraEngine(
 
             val recSurface = recorder.surface
             mediaRecorder = recorder
+            recordingSurface = recSurface
             recordingPfd = pfd
             recordingUri = uri
 
@@ -598,27 +616,44 @@ class TrueLensCameraEngine(
 
     fun stopVideoRecording(onSaved: (Uri?) -> Unit) {
         val savedUri = recordingUri
+        var stopSucceeded = false
         if (isRecordingVideo) {
             try {
+                captureSession?.stopRepeating()
+            } catch (_: Exception) {
+            }
+            try {
                 mediaRecorder?.stop()
+                stopSucceeded = true
             } catch (e: Exception) {
-                Log.w(TAG, "MediaRecorder stop warning", e)
+                Log.w(TAG, "MediaRecorder stop warning (too short?)", e)
+                stopSucceeded = false
             }
         }
         cleanupRecorder()
-        if (savedUri != null) {
+        val finalUri = if (savedUri != null && stopSucceeded) {
             try {
                 val done = ContentValues().apply { put(MediaStore.Video.Media.IS_PENDING, 0) }
                 context.contentResolver.update(savedUri, done, null, null)
             } catch (_: Exception) {
             }
+            savedUri
+        } else {
+            if (savedUri != null) {
+                try {
+                    context.contentResolver.delete(savedUri, null, null)
+                } catch (_: Exception) {
+                }
+            }
+            null
         }
         createCaptureSession()
-        onSaved(savedUri)
+        onSaved(finalUri)
     }
 
     private fun cleanupRecorder() {
         isRecordingVideo = false
+        recordingSurface = null
         try {
             mediaRecorder?.reset()
             mediaRecorder?.release()
@@ -712,8 +747,12 @@ class TrueLensCameraEngine(
         val surface = previewSurface ?: return
 
         try {
-            val builder = device.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW)
+            val template = if (isRecordingVideo) CameraDevice.TEMPLATE_RECORD else CameraDevice.TEMPLATE_PREVIEW
+            val builder = device.createCaptureRequest(template)
             builder.addTarget(surface)
+            if (isRecordingVideo) {
+                recordingSurface?.takeIf { it.isValid }?.let { builder.addTarget(it) }
+            }
             applyRequestParameters(builder, currentSettings)
 
             session.setRepeatingRequest(

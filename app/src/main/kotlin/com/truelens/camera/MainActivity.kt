@@ -74,17 +74,32 @@ class MainActivity : ComponentActivity() {
                 }
 
                 val permissionLauncher = rememberLauncherForActivityResult(
-                    contract = ActivityResultContracts.RequestPermission()
-                ) { granted ->
-                    hasCameraPermission = granted
-                    if (granted) cameraViewModel.initializeCameras()
+                    contract = ActivityResultContracts.RequestMultiplePermissions()
+                ) { results ->
+                    val camGranted = results[Manifest.permission.CAMERA] == true ||
+                        ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) ==
+                        PackageManager.PERMISSION_GRANTED
+                    hasCameraPermission = camGranted
+                    if (camGranted) {
+                        cameraViewModel.initializeCameras()
+                        cameraViewModel.syncHandsFreeControllers()
+                    }
                 }
 
                 LaunchedEffect(hasCameraPermission) {
+                    val hasAudio = ContextCompat.checkSelfPermission(
+                        this@MainActivity,
+                        Manifest.permission.RECORD_AUDIO
+                    ) == PackageManager.PERMISSION_GRANTED
                     if (hasCameraPermission) {
                         cameraViewModel.initializeCameras()
+                        if (!hasAudio) {
+                            permissionLauncher.launch(arrayOf(Manifest.permission.RECORD_AUDIO))
+                        }
                     } else {
-                        permissionLauncher.launch(Manifest.permission.CAMERA)
+                        permissionLauncher.launch(
+                            arrayOf(Manifest.permission.CAMERA, Manifest.permission.RECORD_AUDIO)
+                        )
                     }
                 }
 
@@ -115,7 +130,11 @@ class MainActivity : ComponentActivity() {
                         )
                         Spacer(modifier = Modifier.height(24.dp))
                         Button(
-                            onClick = { permissionLauncher.launch(Manifest.permission.CAMERA) },
+                            onClick = {
+                                permissionLauncher.launch(
+                                    arrayOf(Manifest.permission.CAMERA, Manifest.permission.RECORD_AUDIO)
+                                )
+                            },
                             colors = ButtonDefaults.buttonColors(
                                 containerColor = Color(0xFFFFB300),
                                 contentColor = Color.Black

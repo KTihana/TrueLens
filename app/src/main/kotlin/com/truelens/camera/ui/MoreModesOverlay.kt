@@ -65,7 +65,8 @@ fun FloatingLensZoomCapsule(
         else -> zoomRatio
     }
 
-    val stops = if (hasUltrawide) listOf(0.6f, 1.0f, 2.0f, 3.0f) else listOf(0.6f, 1.0f, 2.0f, 3.0f)
+    val supportsUltrawide = hasUltrawide || (activeLens?.minZoomRatio ?: 1.0f) < 0.92f
+    val stops = if (supportsUltrawide) listOf(0.6f, 1.0f, 2.0f, 3.0f) else listOf(1.0f, 2.0f, 3.0f)
     val closestStop = stops.minByOrNull { abs(it - effectiveZoom) } ?: 1.0f
 
     Row(

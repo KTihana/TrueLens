@@ -105,12 +105,12 @@ fun DarkroomScreen(
     var showOriginal by remember { mutableStateOf(false) }
     var showDeleteConfirm by remember { mutableStateOf(false) }
     var activeTab by remember { mutableStateOf(DarkroomTab.PRESETS) }
-    var selectedPresetId by remember { mutableStateOf("true_zero") }
+    var selectedPresetId by remember(state.darkroomSourceUri) { mutableStateOf("true_zero") }
     var straightenAxis by remember { mutableStateOf(0) } // 0 = Rotate, 1 = Vertical Tilt, 2 = Horizontal Tilt
 
     val displayBitmap = if (showOriginal) state.darkroomSourceBitmap else state.darkroomGradedBitmap
-    val recentShots by produceState<List<GalleryPhotoItem>>(initialValue = emptyList()) {
-        value = queryTrueLensGallery(context)
+    val recentShots by produceState<List<GalleryPhotoItem>>(initialValue = emptyList(), state.darkroomSourceUri) {
+        value = queryTrueLensGallery(context, includeVideos = false)
     }
 
     // Small base thumbnail for fast real-time graded preset preview tiles

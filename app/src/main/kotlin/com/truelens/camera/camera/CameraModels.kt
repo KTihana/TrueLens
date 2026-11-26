@@ -114,7 +114,9 @@ data class LensInfo(
     val previewSize: Size,
     val maxRawSize: Size?,
     val maxJpegSize: Size,
-    val displayLabel: String
+    val displayLabel: String,
+    val minZoomRatio: Float = 1.0f,
+    val maxZoomRatio: Float = 8.0f
 )
 
 data class ManualSettings(
