@@ -1,8 +1,12 @@
 package com.truelens.camera.ui
 
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
+import android.provider.Settings
+import android.widget.Toast
 import android.hardware.Sensor
 import android.hardware.SensorEvent
 import android.hardware.SensorEventListener
@@ -23,6 +27,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectDragGestures
+import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.gestures.detectTransformGestures
@@ -51,23 +56,36 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.AccessibilityNew
 import androidx.compose.material.icons.filled.Cameraswitch
+import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.material.icons.filled.FlashAuto
 import androidx.compose.material.icons.filled.FlashOff
 import androidx.compose.material.icons.filled.FlashOn
 import androidx.compose.material.icons.filled.FlashlightOn
+import androidx.compose.material.icons.filled.Link
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.LockOpen
 import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.MicOff
 import androidx.compose.material.icons.filled.MoreHoriz
+import androidx.compose.material.icons.filled.MotionPhotosOn
+import androidx.compose.material.icons.filled.MusicNote
+import androidx.compose.material.icons.filled.NightsStay
 import androidx.compose.material.icons.filled.Palette
+import androidx.compose.material.icons.filled.Pause
+import androidx.compose.material.icons.filled.PhotoCamera
 import androidx.compose.material.icons.filled.PhotoLibrary
 import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.filled.QrCode2
+import androidx.compose.material.icons.filled.TextFields
 import androidx.compose.material.icons.filled.Timer
 import androidx.compose.material.icons.filled.Tune
 import androidx.compose.material.icons.filled.WbSunny
+import androidx.compose.material.icons.filled.Wifi
+import androidx.compose.foundation.text.selection.SelectionContainer
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Slider
@@ -104,8 +122,11 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
+import com.truelens.camera.camera.AstroStyle
 import com.truelens.camera.camera.DocumentScanStyle
+import com.truelens.camera.camera.DoubleExpBlendMode
 import com.truelens.camera.camera.ShootingMode
+import com.truelens.camera.camera.SkyPreset
 import com.truelens.camera.camera.StabilizerMode
 import com.truelens.camera.gl.AspectRatioMath
 import com.truelens.camera.gl.CameraGlSurfaceView
@@ -182,6 +203,8 @@ fun CameraScreen(
             onUndo = { viewModel.undoDarkroom() },
             onRedo = { viewModel.redoDarkroom() },
             onDeletePhoto = { viewModel.deleteDarkroomPhoto() },
+            onSaveKeyPhoto = { frame -> viewModel.saveDarkroomKeyPhoto(frame) },
+            onExportLiveVideo = { viewModel.exportDarkroomLiveVideo() },
             onExport = { viewModel.exportDarkroomCopy() }
         )
         return
@@ -189,11 +212,15 @@ fun CameraScreen(
 
     var focusTapPos by remember { mutableStateOf<Offset?>(null) }
     var rollDegrees by remember { mutableFloatStateOf(0f) }
+    var isFlatLay by remember { mutableStateOf(false) }
+    var flatTiltX by remember { mutableFloatStateOf(0f) }
+    var flatTiltY by remember { mutableFloatStateOf(0f) }
     var showQuickTools by remember { mutableStateOf(false) }
     var showMoreModes by remember { mutableStateOf(false) }
     var swipeEvVisible by remember { mutableStateOf(false) }
     var swipeEvAccum by remember { mutableFloatStateOf(0f) }
     var lastPinchMs by remember { mutableStateOf(0L) }
+    var modeSwipeAccum by remember { mutableFloatStateOf(0f) }
     val gyroStabilizer = remember { GyroStabilizer() }
     var glSurfaceRef by remember { mutableStateOf<CameraGlSurfaceView?>(null) }
 
@@ -204,19 +231,31 @@ fun CameraScreen(
         }
     }
 
-    BackHandler(enabled = showMoreModes || showQuickTools || state.activeDeck != ActiveDeck.NONE) {
-        showMoreModes = false
-        showQuickTools = false
-        viewModel.setActiveDeck(ActiveDeck.NONE)
+    BackHandler(
+        enabled = showMoreModes || showQuickTools || state.activeDeck != ActiveDeck.NONE || state.isLiveTextSheetOpen
+    ) {
+        if (state.isLiveTextSheetOpen) {
+            viewModel.closeLiveTextSheet()
+        } else {
+            showMoreModes = false
+            showQuickTools = false
+            viewModel.setActiveDeck(ActiveDeck.NONE)
+        }
     }
 
     val isVideoOrSlowMo = state.settings.shootingMode == ShootingMode.VIDEO ||
-        state.settings.shootingMode == ShootingMode.SLOW_MO
+        state.settings.shootingMode == ShootingMode.SLOW_MO ||
+        state.settings.shootingMode == ShootingMode.CINEMATIC
     val superSteadyActive = isVideoOrSlowMo &&
         state.settings.stabilizerMode == StabilizerMode.SUPER_STEADY
+    val needAccelLevel = state.settings.levelGauge || state.settings.shootingMode == ShootingMode.SCAN_DOC
+    val needGyroStability = state.settings.shootingMode == ShootingMode.ASTRO ||
+        state.settings.shootingMode == ShootingMode.LONG_EXP
+    val astroRed = state.settings.astroRedUiEnabled
+    val hudAccent = if (astroRed) Color(0xFFDC2626) else TrueLensPalette.AccentViolet
 
-    // Accelerometer (Horizon Level) + Ambient Light (True Auto) + Gyroscope (Panorama & Super Steady)
-    DisposableEffect(state.settings.levelGauge, state.panoramaState.isCapturing, superSteadyActive) {
+    // Accelerometer (Horizon + Flat-Lay Crosshair Level) + Ambient Light (True Auto & Night) + Gyroscope
+    DisposableEffect(needAccelLevel, state.panoramaState.isCapturing, superSteadyActive, needGyroStability) {
         val sm = context.getSystemService(Context.SENSOR_SERVICE) as SensorManager
         val accel = sm.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
         val light = sm.getDefaultSensor(Sensor.TYPE_LIGHT)
@@ -230,17 +269,32 @@ fun CameraScreen(
             override fun onSensorChanged(event: SensorEvent) {
                 when (event.sensor.type) {
                     Sensor.TYPE_ACCELEROMETER -> {
-                        if (state.settings.levelGauge) {
+                        if (needAccelLevel) {
                             val ax = event.values[0]
                             val ay = event.values[1]
-                            val angle = Math.toDegrees(atan2(ax.toDouble(), ay.toDouble())).toFloat()
-                            rollDegrees = rollDegrees * 0.8f + angle * 0.2f
+                            val az = event.values[2]
+                            val flat = kotlin.math.abs(az) > 7.8f
+                            isFlatLay = flat
+                            if (flat) {
+                                flatTiltX = flatTiltX * 0.75f + ax * 0.25f
+                                flatTiltY = flatTiltY * 0.75f + ay * 0.25f
+                            } else {
+                                val angle = Math.toDegrees(atan2(ax.toDouble(), ay.toDouble())).toFloat()
+                                rollDegrees = rollDegrees * 0.8f + angle * 0.2f
+                            }
                         }
                     }
                     Sensor.TYPE_LIGHT -> {
                         viewModel.updateAmbientLux(event.values[0])
                     }
                     Sensor.TYPE_GYROSCOPE -> {
+                        if (needGyroStability) {
+                            val wx = event.values[0]
+                            val wy = event.values[1]
+                            val wz = event.values[2]
+                            val mag = kotlin.math.sqrt(wx * wx + wy * wy + wz * wz)
+                            viewModel.onGyroAngularSpeed(mag)
+                        }
                         if (state.panoramaState.isCapturing) {
                             if (lastGyroTs != 0L) {
                                 val dt = (event.timestamp - lastGyroTs) / 1_000_000_000f
@@ -269,13 +323,13 @@ fun CameraScreen(
             }
             override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) = Unit
         }
-        if (accel != null && state.settings.levelGauge) {
+        if (accel != null && needAccelLevel) {
             sm.registerListener(listener, accel, SensorManager.SENSOR_DELAY_UI)
         }
         if (light != null) {
             sm.registerListener(listener, light, SensorManager.SENSOR_DELAY_UI)
         }
-        if (gyro != null && (state.panoramaState.isCapturing || superSteadyActive)) {
+        if (gyro != null && (state.panoramaState.isCapturing || superSteadyActive || needGyroStability)) {
             sm.registerListener(listener, gyro, SensorManager.SENSOR_DELAY_GAME)
         }
         onDispose { sm.unregisterListener(listener) }
@@ -445,6 +499,26 @@ fun CameraScreen(
                                     }
                                 )
                             }
+                            .pointerInput(state.settings.splitScreenEnabled, showMoreModes, state.isVideoRecording) {
+                                if (!state.settings.splitScreenEnabled && !showMoreModes && !state.isVideoRecording) {
+                                    detectHorizontalDragGestures(
+                                        onDragStart = { modeSwipeAccum = 0f },
+                                        onHorizontalDrag = { _, dragAmount ->
+                                            if (System.currentTimeMillis() - lastPinchMs > 280L) {
+                                                modeSwipeAccum += dragAmount
+                                            }
+                                        },
+                                        onDragEnd = {
+                                            if (modeSwipeAccum < -110f) {
+                                                viewModel.swipePrimaryMode(+1)
+                                            } else if (modeSwipeAccum > 110f) {
+                                                viewModel.swipePrimaryMode(-1)
+                                            }
+                                            modeSwipeAccum = 0f
+                                        }
+                                    )
+                                }
+                            }
                             .pointerInput(Unit) {
                                 detectTapGestures(
                                     onTap = { offset ->
@@ -473,6 +547,12 @@ fun CameraScreen(
                                 },
                                 onPalmSampled = { bmp ->
                                     viewModel.onPalmPreviewSample(bmp)
+                                },
+                                onScannerSampled = { bmp ->
+                                    viewModel.onScannerPreviewSample(bmp)
+                                },
+                                onLivePhotoSampled = { bmp ->
+                                    viewModel.onLivePhotoPreviewSample(bmp)
                                 }
                             ).also { glSurfaceRef = it }
                         },
@@ -488,11 +568,26 @@ fun CameraScreen(
                             glView.renderer.palmSamplingEnabled =
                                 state.settings.handsFreeMode == com.truelens.camera.camera.HandsFreeMode.HAND ||
                                     state.settings.handsFreeMode == com.truelens.camera.camera.HandsFreeMode.BOTH
+                            glView.renderer.scannerSamplingEnabled =
+                                state.settings.shootingMode == ShootingMode.PHOTO &&
+                                    !state.isVideoRecording &&
+                                    (state.settings.qrScannerEnabled || state.settings.liveTextEnabled)
+                            glView.renderer.livePhotoSamplingEnabled =
+                                state.settings.livePhotoEnabled &&
+                                    state.settings.shootingMode == ShootingMode.PHOTO &&
+                                    !state.isVideoRecording
+                            val bokehMode = state.settings.shootingMode == ShootingMode.PORTRAIT ||
+                                state.settings.shootingMode == ShootingMode.CINEMATIC
+                            val bokehStr = if (bokehMode) {
+                                ((16.0f - state.settings.portraitApertureF) / 14.6f).coerceIn(0.05f, 1.0f)
+                            } else 0f
+                            glView.updateBokeh(bokehStr, state.rackFocusNormX, state.rackFocusNormY)
                             glView.updateGrade(
                                 grade = state.grade,
                                 focusPeaking = state.settings.focusPeaking,
                                 zebras = state.settings.zebras,
-                                macroLoupe = state.settings.shootingMode == ShootingMode.SUPER_MACRO,
+                                macroLoupe = state.settings.shootingMode == ShootingMode.SUPER_MACRO ||
+                                    (state.settings.shootingMode == ShootingMode.ASTRO && state.settings.astroStarLoupeEnabled),
                                 splitScreenPos = if (state.settings.splitScreenEnabled) state.splitScreenPosition else -1f,
                                 bypass = state.bypassLiveGrade
                             )
@@ -524,6 +619,45 @@ fun CameraScreen(
                             contentScale = ContentScale.Fit,
                             alpha = state.stopMotionState.onionSkinOpacity,
                             modifier = Modifier.fillMaxSize()
+                        )
+                    }
+
+                    // DOUBLE EXPOSURE SHOT #1 GHOST OVERLAY (frame Shot #2 directly on top of Shot #1!)
+                    val ghostBmp = state.doubleExpFirstShot
+                    if (state.settings.shootingMode == ShootingMode.DOUBLE_EXP &&
+                        ghostBmp != null &&
+                        !ghostBmp.isRecycled
+                    ) {
+                        Image(
+                            bitmap = ghostBmp.asImageBitmap(),
+                            contentDescription = "Double Exposure Shot 1 Ghost",
+                            contentScale = ContentScale.Fit,
+                            alpha = 0.45f,
+                            modifier = Modifier.fillMaxSize()
+                        )
+                    }
+
+                    // LIVE 90s VHS CAMCORDER VIEWFINDER OSD (only when VHS look is explicitly chosen!)
+                    if (state.grade.vhsRetro > 0.01f && !state.bypassLiveGrade) {
+                        Text(
+                            text = if (state.isVideoRecording) "● REC  SP" else "PLAY ▶",
+                            color = Color.White.copy(alpha = 0.90f),
+                            fontSize = 13.sp,
+                            fontWeight = FontWeight.Bold,
+                            fontFamily = FontFamily.Monospace,
+                            modifier = Modifier
+                                .align(Alignment.TopStart)
+                                .padding(start = 14.dp, top = 46.dp)
+                        )
+                        Text(
+                            text = "SLP  '98",
+                            color = Color(0xFFFFD88A).copy(alpha = 0.90f),
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.Bold,
+                            fontFamily = FontFamily.Monospace,
+                            modifier = Modifier
+                                .align(Alignment.BottomStart)
+                                .padding(start = 14.dp, bottom = 74.dp)
                         )
                     }
 
@@ -719,11 +853,176 @@ fun CameraScreen(
                         isLocked = state.telemetry.isAfLocked
                     )
 
-                    if (state.settings.levelGauge) {
+                    // Automatic QR Code Corner Brackets (iPhone-style yellow brackets locked onto QR code!)
+                    if (state.settings.qrScannerEnabled && state.settings.shootingMode == ShootingMode.PHOTO) {
+                        QrBracketsOverlay(qr = state.detectedQr)
+                    }
+
+                    if (needAccelLevel) {
                         HorizonLevelOverlay(
                             rollDegrees = rollDegrees,
+                            isFlatLay = isFlatLay,
+                            flatTiltX = flatTiltX,
+                            flatTiltY = flatTiltY,
                             modifier = Modifier.align(Alignment.Center)
                         )
+                    }
+
+                    // Quick Top-Left Auto Low-Light Moon Pill (Toggleable via Auto Night!) & Top-Right LIVE Photo Pill
+                    if (!state.settings.friendMode && !showMoreModes && state.settings.shootingMode == ShootingMode.PHOTO) {
+                        if ((state.settings.autoNightPromptEnabled && state.isDarkLowLightScene) ||
+                            state.settings.nightModeDuration != com.truelens.camera.camera.NightModeDuration.OFF
+                        ) {
+                            val nightActive = state.settings.nightModeDuration != com.truelens.camera.camera.NightModeDuration.OFF
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                modifier = Modifier
+                                    .align(Alignment.TopStart)
+                                    .padding(10.dp)
+                                    .clip(RoundedCornerShape(16.dp))
+                                    .background(if (nightActive) Color(0xDDFFD60A) else Color(0x88000000))
+                                    .clickable { viewModel.cycleNightModeDuration() }
+                                    .padding(horizontal = 9.dp, vertical = 5.dp)
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.NightsStay,
+                                    contentDescription = "Night Mode",
+                                    tint = if (nightActive) Color.Black else Color(0xFFFFD60A),
+                                    modifier = Modifier.size(14.dp)
+                                )
+                                Spacer(modifier = Modifier.width(4.dp))
+                                Text(
+                                    text = if (nightActive) state.settings.nightModeDuration.label else "Night",
+                                    color = if (nightActive) Color.Black else Color.White,
+                                    fontSize = 11.sp,
+                                    fontWeight = FontWeight.SemiBold
+                                )
+                            }
+                        }
+
+                        // Quick 1-tap LIVE Photo Badge (amber ring when ON!)
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            modifier = Modifier
+                                .align(Alignment.TopEnd)
+                                .padding(10.dp)
+                                .clip(RoundedCornerShape(16.dp))
+                                .background(if (state.settings.livePhotoEnabled) Color(0xCC1C1808) else Color(0x66000000))
+                                .border(
+                                    0.75.dp,
+                                    if (state.settings.livePhotoEnabled) Color(0xFFFFB300) else Color.White.copy(alpha = 0.22f),
+                                    RoundedCornerShape(16.dp)
+                                )
+                                .clickable { viewModel.toggleLivePhoto() }
+                                .padding(horizontal = 9.dp, vertical = 5.dp)
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.MotionPhotosOn,
+                                contentDescription = "Live Photos",
+                                tint = if (state.settings.livePhotoEnabled) Color(0xFFFFB300) else Color.White.copy(alpha = 0.72f),
+                                modifier = Modifier.size(14.dp)
+                            )
+                            Spacer(modifier = Modifier.width(4.dp))
+                            Text(
+                                text = "LIVE",
+                                color = if (state.settings.livePhotoEnabled) Color(0xFFFFB300) else Color.White.copy(alpha = 0.75f),
+                                fontSize = 10.sp,
+                                fontWeight = FontWeight.Bold
+                            )
+                        }
+                    }
+
+                    // Multi-Frame Optical Night Mode Progress Ring
+                    if (state.isNightStacking) {
+                        Box(
+                            modifier = Modifier
+                                .align(Alignment.Center)
+                                .size(104.dp)
+                                .clip(CircleShape)
+                                .background(Color(0xBB0C0C10)),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            CircularProgressIndicator(
+                                progress = { state.nightStackProgress },
+                                color = Color(0xFFFFD60A),
+                                strokeWidth = 4.dp,
+                                modifier = Modifier.size(90.dp)
+                            )
+                            Text(
+                                text = "NIGHT",
+                                color = Color(0xFFFFD60A),
+                                fontSize = 12.sp,
+                                fontWeight = FontWeight.Bold
+                            )
+                        }
+                    }
+
+                    // Portrait / Action Pan / Double Exp / VHS Bake Processing Spinner
+                    if (state.isPortraitProcessing || state.isActionPanProcessing || state.isProcessingDoubleExp || state.isBakingVhs) {
+                        Column(
+                            horizontalAlignment = Alignment.CenterHorizontally,
+                            modifier = Modifier
+                                .align(Alignment.Center)
+                                .clip(RoundedCornerShape(18.dp))
+                                .background(Color(0xCC0C0C10))
+                                .padding(horizontal = 18.dp, vertical = 14.dp)
+                        ) {
+                            CircularProgressIndicator(
+                                color = hudAccent,
+                                strokeWidth = 3.dp,
+                                modifier = Modifier.size(32.dp)
+                            )
+                            val procLabel = when {
+                                state.isBakingVhs -> "Baking VHS '94..."
+                                state.isActionPanProcessing -> "Action Pan..."
+                                state.isProcessingDoubleExp -> "Blending 2×..."
+                                else -> "Portrait..."
+                            }
+                            Spacer(modifier = Modifier.height(8.dp))
+                            Text(procLabel, color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.SemiBold)
+                        }
+                    }
+
+                    // Astrophotography Optical Stacking Progress Ring + Anti-Shake Status
+                    if (state.isAstroCapturing) {
+                        Column(
+                            horizontalAlignment = Alignment.CenterHorizontally,
+                            modifier = Modifier
+                                .align(Alignment.Center)
+                                .clip(RoundedCornerShape(22.dp))
+                                .background(Color(0xDD0A0A0E))
+                                .border(1.dp, hudAccent.copy(alpha = 0.7f), RoundedCornerShape(22.dp))
+                                .padding(horizontal = 20.dp, vertical = 16.dp)
+                        ) {
+                            Box(contentAlignment = Alignment.Center) {
+                                CircularProgressIndicator(
+                                    progress = { state.astroProgress },
+                                    color = hudAccent,
+                                    strokeWidth = 4.dp,
+                                    modifier = Modifier.size(76.dp)
+                                )
+                                Text(
+                                    text = "${(state.astroProgress * 100).toInt()}%",
+                                    color = Color.White,
+                                    fontSize = 15.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    fontFamily = FontFamily.Monospace
+                                )
+                            }
+                            Spacer(modifier = Modifier.height(8.dp))
+                            Text(
+                                text = state.astroPhaseLabel.ifBlank { "Stacking Stars..." },
+                                color = if (astroRed) Color(0xFFEF4444) else Color.White,
+                                fontSize = 11.5.sp,
+                                fontWeight = FontWeight.SemiBold
+                            )
+                            Text(
+                                text = "Kept ${state.astroKeptFrames} • Skipped ${state.astroDroppedFrames} shaken",
+                                color = TrueLensPalette.MutedGray,
+                                fontSize = 10.sp,
+                                fontFamily = FontFamily.Monospace
+                            )
+                        }
                     }
 
                     // Self-Timer Countdown Overlay
@@ -806,8 +1105,12 @@ fun CameraScreen(
                         }
                     }
 
-                    // Floating Translucent 0.6 | 1x | 2 | 3 Lens & Zoom Capsule right inside bottom of viewfinder!
+                    // Floating Translucent 0.6 | 1x | 2 | 3 Lens & Smooth Zoom Wheel + Automatic QR Suggestion Pill!
                     val hasActiveModeBar = isVideoOrSlowMo ||
+                        state.settings.shootingMode == ShootingMode.PORTRAIT ||
+                        state.settings.shootingMode == ShootingMode.ASTRO ||
+                        state.settings.shootingMode == ShootingMode.DOUBLE_EXP ||
+                        state.settings.shootingMode == ShootingMode.ACTION_PAN ||
                         state.settings.shootingMode == ShootingMode.DUAL ||
                         state.settings.shootingMode == ShootingMode.LONG_EXP ||
                         state.settings.shootingMode == ShootingMode.SUPER_MACRO ||
@@ -815,13 +1118,114 @@ fun CameraScreen(
                         state.settings.shootingMode == ShootingMode.SCAN_DOC ||
                         state.settings.shootingMode == ShootingMode.PANORAMA ||
                         state.settings.shootingMode == ShootingMode.TIMELAPSE
+                    val barOverlapDp = when {
+                        state.settings.shootingMode == ShootingMode.ASTRO -> (108.dp - bottomGapDp).coerceAtLeast(0.dp)
+                        hasActiveModeBar -> (68.dp - bottomGapDp).coerceAtLeast(0.dp)
+                        else -> 0.dp
+                    }
+
+                    // Compact iPhone-Style QR Suggestion Pill (floats cleanly right above zoom bar!)
+                    val activeQr = state.detectedQr
+                    if (activeQr != null && !showMoreModes && !showQuickTools && state.settings.shootingMode == ShootingMode.PHOTO) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            modifier = Modifier
+                                .align(Alignment.BottomCenter)
+                                .padding(bottom = 62.dp + barOverlapDp, start = 20.dp, end = 20.dp)
+                                .clip(RoundedCornerShape(20.dp))
+                                .background(Color(0xEEFFD60A))
+                                .clickable {
+                                    handleQrCodeAction(context, activeQr)
+                                    viewModel.dismissQr()
+                                }
+                                .padding(horizontal = 13.dp, vertical = 7.dp)
+                        ) {
+                            Icon(
+                                imageVector = when (activeQr.actionType) {
+                                    com.truelens.camera.modes.QrActionType.WIFI -> Icons.Default.Wifi
+                                    com.truelens.camera.modes.QrActionType.URL -> Icons.Default.Link
+                                    else -> Icons.Default.QrCode2
+                                },
+                                contentDescription = "QR Action",
+                                tint = Color.Black,
+                                modifier = Modifier.size(15.dp)
+                            )
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text(
+                                text = activeQr.displayLabel,
+                                color = Color.Black,
+                                fontSize = 12.sp,
+                                fontWeight = FontWeight.Bold,
+                                maxLines = 1
+                            )
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Icon(
+                                imageVector = Icons.Default.Close,
+                                contentDescription = "Dismiss QR",
+                                tint = Color.Black.copy(alpha = 0.65f),
+                                modifier = Modifier
+                                    .size(15.dp)
+                                    .clickable { viewModel.dismissQr() }
+                            )
+                        }
+                    }
+
+                    // Bottom-Right Quick Corner Icons: Sticky QR button + Live Text [T] button (iPhone one-hand reach!)
+                    if (!showMoreModes && !showQuickTools && state.activeDeck == ActiveDeck.NONE && state.settings.shootingMode == ShootingMode.PHOTO) {
+                        Row(
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            modifier = Modifier
+                                .align(Alignment.BottomEnd)
+                                .padding(end = 14.dp, bottom = 14.dp + barOverlapDp)
+                        ) {
+                            val stickyQr = state.stickyQr
+                            if (stickyQr != null) {
+                                Box(
+                                    modifier = Modifier
+                                        .size(36.dp)
+                                        .clip(CircleShape)
+                                        .background(Color(0xDDFFD60A))
+                                        .clickable {
+                                            handleQrCodeAction(context, stickyQr)
+                                            viewModel.dismissQr()
+                                        },
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Default.QrCode2,
+                                        contentDescription = "Open Scanned QR",
+                                        tint = Color.Black,
+                                        modifier = Modifier.size(19.dp)
+                                    )
+                                }
+                            }
+                            if (state.detectedLiveText != null && state.settings.liveTextEnabled) {
+                                Box(
+                                    modifier = Modifier
+                                        .size(36.dp)
+                                        .clip(CircleShape)
+                                        .background(Color(0xAA101218))
+                                        .border(1.dp, Color(0xFFFFD60A).copy(alpha = 0.85f), CircleShape)
+                                        .clickable { viewModel.openLiveTextSheet() },
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Default.TextFields,
+                                        contentDescription = "Live Text Detected",
+                                        tint = Color(0xFFFFD60A),
+                                        modifier = Modifier.size(18.dp)
+                                    )
+                                }
+                            }
+                        }
+                    }
+
                     if (!showMoreModes &&
                         !showQuickTools &&
                         state.activeDeck == ActiveDeck.NONE &&
                         state.activeLens?.isFront != true &&
                         state.settings.shootingMode != ShootingMode.DUAL
                     ) {
-                        val barOverlapDp = if (hasActiveModeBar) (62.dp - bottomGapDp).coerceAtLeast(0.dp) else 0.dp
                         Box(
                             modifier = Modifier
                                 .align(Alignment.BottomCenter)
@@ -831,7 +1235,69 @@ fun CameraScreen(
                                 activeLens = state.activeLens,
                                 zoomRatio = state.zoomRatio,
                                 hasUltrawide = hasUltrawide,
-                                onSelectStop = { stop -> viewModel.selectZoomStop(stop) }
+                                onSelectStop = { stop -> viewModel.selectZoomStop(stop) },
+                                onExactZoom = { z -> viewModel.setExactZoom(z) }
+                            )
+                        }
+                    }
+
+                    // Floating Draggable Second Shutter Button (Feature #9: Tap to shoot • Long-press & drag to move!)
+                    if (state.settings.floatingShutterEnabled && !showMoreModes) {
+                        var isDraggingFloat by remember { mutableStateOf(false) }
+                        var dragNormX by remember(state.floatingShutterX) { mutableFloatStateOf(state.floatingShutterX) }
+                        var dragNormY by remember(state.floatingShutterY) { mutableFloatStateOf(state.floatingShutterY) }
+                        Box(
+                            modifier = Modifier
+                                .offset {
+                                    val pxX = (dragNormX * frameWidthDp.toPx()).roundToInt() - 29.dp.roundToPx()
+                                    val pxY = (dragNormY * frameHeightDp.toPx()).roundToInt() - 29.dp.roundToPx()
+                                    IntOffset(pxX, pxY)
+                                }
+                                .size(58.dp)
+                                .clip(CircleShape)
+                                .background(if (isDraggingFloat) hudAccent.copy(alpha = 0.45f) else Color(0x66000000))
+                                .border(
+                                    width = if (isDraggingFloat) 2.5.dp else 2.dp,
+                                    color = if (isDraggingFloat) hudAccent else Color.White.copy(alpha = 0.88f),
+                                    shape = CircleShape
+                                )
+                                .pointerInput(frameWidthDp, frameHeightDp) {
+                                    detectDragGesturesAfterLongPress(
+                                        onDragStart = {
+                                            isDraggingFloat = true
+                                            haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                                        },
+                                        onDragEnd = {
+                                            isDraggingFloat = false
+                                            viewModel.updateFloatingShutterPos(dragNormX, dragNormY)
+                                        },
+                                        onDragCancel = {
+                                            isDraggingFloat = false
+                                            viewModel.updateFloatingShutterPos(dragNormX, dragNormY)
+                                        },
+                                        onDrag = { change, dragAmount ->
+                                            change.consume()
+                                            val wPx = frameWidthDp.toPx().coerceAtLeast(1f)
+                                            val hPx = frameHeightDp.toPx().coerceAtLeast(1f)
+                                            dragNormX = (dragNormX + dragAmount.x / wPx).coerceIn(0.08f, 0.92f)
+                                            dragNormY = (dragNormY + dragAmount.y / hPx).coerceIn(0.12f, 0.88f)
+                                        }
+                                    )
+                                }
+                                .clickable {
+                                    haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                                    viewModel.onShutterPressed()
+                                },
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Box(
+                                modifier = Modifier
+                                    .size(44.dp)
+                                    .clip(CircleShape)
+                                    .background(
+                                        if (isVideoOrSlowMo || state.isVideoRecording) TrueLensPalette.RecordCoral.copy(alpha = 0.85f)
+                                        else Color.White.copy(alpha = 0.88f)
+                                    )
                             )
                         }
                     }
@@ -1012,7 +1478,16 @@ fun CameraScreen(
                             onToggleHistogram = { viewModel.toggleHistogram() },
                             onToggleFocusEdges = { viewModel.toggleFocusPeaking() },
                             onCycleDateStamp = { viewModel.cycleDateStampStyle() },
-                            onCycleHandsFree = { viewModel.cycleHandsFreeMode() }
+                            onCycleHandsFree = { viewModel.cycleHandsFreeMode() },
+                            onToggleEnhanceMode = { viewModel.toggleEnhanceMode() },
+                            onToggleLivePhoto = { viewModel.toggleLivePhoto() },
+                            onCycleNightMode = { viewModel.cycleNightModeDuration() },
+                            onToggleQrScanner = { viewModel.toggleQrScanner() },
+                            onToggleLiveText = { viewModel.toggleLiveText() },
+                            onToggleShutterSound = { viewModel.toggleShutterSound() },
+                            onToggleFloatingShutter = { viewModel.toggleFloatingShutter() },
+                            onToggleAudioMeter = { viewModel.toggleAudioMeter() },
+                            onToggleAutoNightPrompt = { viewModel.toggleAutoNightPrompt() }
                         )
                     }
 
@@ -1060,605 +1535,15 @@ fun CameraScreen(
                         )
                     }
 
-            // Video & Slow-Mo Super Steady Stabilizer Bar
-            if (!state.settings.friendMode && isVideoOrSlowMo) {
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(horizontal = 16.dp, vertical = 4.dp)
-                        .clip(RoundedCornerShape(12.dp))
-                        .background(Color(0xCC0E1014))
-                        .border(
-                            0.75.dp,
-                            if (state.isVideoRecording) CanonRed else Color.White.copy(alpha = 0.18f),
-                            RoundedCornerShape(12.dp)
-                        )
-                        .padding(horizontal = 12.dp, vertical = 7.dp),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    if (state.isVideoRecording) {
-                        val mm = state.videoElapsedSec / 60
-                        val ss = state.videoElapsedSec % 60
-                        Text(
-                            text = String.format("● REC  %02d:%02d  •  %s", mm, ss, state.videoFpsBadge),
-                            color = TrueLensPalette.RecordCoral,
-                            fontSize = 12.sp,
-                            fontWeight = FontWeight.SemiBold
-                        )
-                    } else if (state.settings.shootingMode == ShootingMode.SLOW_MO) {
-                        Text(
-                            text = "Slow-Mo • 120fps",
-                            color = Color.White,
-                            fontSize = 12.sp,
-                            fontWeight = FontWeight.SemiBold
-                        )
-                    } else {
-                        Row(
-                            horizontalArrangement = Arrangement.spacedBy(8.dp),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Box(
-                                modifier = Modifier
-                                    .clip(RoundedCornerShape(8.dp))
-                                    .background(Color(0x22FFFFFF))
-                                    .clickable { viewModel.cycleVideoQuality() }
-                                    .padding(horizontal = 9.dp, vertical = 4.dp)
-                            ) {
-                                Text(
-                                    text = state.settings.videoQuality.label,
-                                    color = Color.White,
-                                    fontSize = 11.sp,
-                                    fontWeight = FontWeight.SemiBold
-                                )
-                            }
-                            Box(
-                                modifier = Modifier
-                                    .clip(RoundedCornerShape(8.dp))
-                                    .background(if (state.settings.micMuted) TrueLensPalette.RecordCoral.copy(alpha = 0.22f) else Color(0x22FFFFFF))
-                                    .clickable { viewModel.toggleMicMuted() }
-                                    .padding(horizontal = 7.dp, vertical = 4.dp)
-                            ) {
-                                Icon(
-                                    imageVector = if (state.settings.micMuted) Icons.Default.MicOff else Icons.Default.Mic,
-                                    contentDescription = "Toggle Mic",
-                                    tint = if (state.settings.micMuted) TrueLensPalette.RecordCoral else Color.White,
-                                    modifier = Modifier.size(15.dp)
-                                )
-                            }
-                        }
-                    }
-                    Row(
-                        horizontalArrangement = Arrangement.spacedBy(6.dp),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        if (state.settings.shootingMode == ShootingMode.VIDEO && !state.isVideoRecording) {
-                            Box(
-                                modifier = Modifier
-                                    .clip(RoundedCornerShape(8.dp))
-                                    .background(
-                                        if (state.settings.cinema180Shutter) TrueLensPalette.AccentVioletSoft
-                                        else Color(0x22FFFFFF)
-                                    )
-                                    .border(
-                                        0.75.dp,
-                                        if (state.settings.cinema180Shutter) TrueLensPalette.AccentViolet
-                                        else Color.White.copy(alpha = 0.16f),
-                                        RoundedCornerShape(8.dp)
-                                    )
-                                    .clickable { viewModel.toggleCinema180Shutter() }
-                                    .padding(horizontal = 8.dp, vertical = 4.dp)
-                            ) {
-                                Text(
-                                    text = "180°",
-                                    color = if (state.settings.cinema180Shutter) TrueLensPalette.AccentViolet else Color.White,
-                                    fontSize = 11.sp,
-                                    fontWeight = FontWeight.SemiBold
-                                )
-                            }
-                        }
-                        HudPill(
-                            text = state.settings.stabilizerMode.label,
-                            accent = when (state.settings.stabilizerMode) {
-                                StabilizerMode.SUPER_STEADY -> ZeroAiGreen
-                                StabilizerMode.STANDARD -> CanonAmber
-                                StabilizerMode.OFF -> Color.Gray
-                            },
-                            filled = state.settings.stabilizerMode != StabilizerMode.OFF,
-                            onClick = { viewModel.cycleStabilizerMode() }
+                    if (!showMoreModes) {
+                        CameraModeControlBars(
+                            state = state,
+                            viewModel = viewModel,
+                            isVideoOrSlowMo = isVideoOrSlowMo,
+                            astroRed = astroRed,
+                            hudAccent = hudAccent
                         )
                     }
-                }
-            }
-
-            // Dual-Camera Reaction Mode Bar (Split vs Call PiP + Swap!)
-            if (!state.settings.friendMode && state.settings.shootingMode == ShootingMode.DUAL) {
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(horizontal = 16.dp, vertical = 4.dp)
-                        .clip(RoundedCornerShape(14.dp))
-                        .background(TrueLensPalette.GlassPanel)
-                        .border(0.75.dp, TrueLensPalette.GlassBorder, RoundedCornerShape(14.dp))
-                        .padding(horizontal = 12.dp, vertical = 7.dp),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                        com.truelens.camera.grading.DualCameraLayout.entries.forEach { layout ->
-                            val sel = state.settings.dualLayout == layout
-                            Box(
-                                modifier = Modifier
-                                    .clip(RoundedCornerShape(9.dp))
-                                    .background(if (sel) TrueLensPalette.AccentViolet else Color(0x1EFFFFFF))
-                                    .clickable {
-                                        if (!sel) viewModel.toggleDualLayout()
-                                    }
-                                    .padding(horizontal = 11.dp, vertical = 5.dp)
-                            ) {
-                                Text(
-                                    text = layout.label,
-                                    color = Color.White,
-                                    fontSize = 11.sp,
-                                    fontWeight = FontWeight.SemiBold
-                                )
-                            }
-                        }
-                    }
-                    Box(
-                        modifier = Modifier
-                            .clip(RoundedCornerShape(9.dp))
-                            .background(Color(0x22FFFFFF))
-                            .clickable { viewModel.swapDualCameras() }
-                            .padding(horizontal = 11.dp, vertical = 5.dp)
-                    ) {
-                        Text(
-                            text = "Swap",
-                            color = Color.White,
-                            fontSize = 11.sp,
-                            fontWeight = FontWeight.SemiBold
-                        )
-                    }
-                }
-            }
-
-            // Long Exposure / Bulb Control Bar
-            if (!state.settings.friendMode && state.settings.shootingMode == ShootingMode.LONG_EXP) {
-                val le = state.longExposureState
-                Column(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(horizontal = 16.dp, vertical = 4.dp)
-                        .clip(RoundedCornerShape(12.dp))
-                        .background(Color(0xCC0E1014))
-                        .border(0.75.dp, CanonAmber.copy(alpha = 0.5f), RoundedCornerShape(12.dp))
-                        .padding(horizontal = 12.dp, vertical = 7.dp)
-                ) {
-                    if (le.isCapturing) {
-                        Text(
-                            text = "EXPOSING ${le.durationSec}s (${(le.progress * 100).toInt()}%) • HOLD STEADY",
-                            color = CanonAmber,
-                            fontSize = 11.sp,
-                            fontWeight = FontWeight.Bold,
-                            fontFamily = FontFamily.Monospace
-                        )
-                    } else {
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.SpaceBetween,
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Row(horizontalArrangement = Arrangement.spacedBy(5.dp)) {
-                                LongExposureStyle.entries.forEach { st ->
-                                    val sel = le.style == st
-                                    Box(
-                                        modifier = Modifier
-                                            .clip(RoundedCornerShape(6.dp))
-                                            .background(if (sel) CanonAmber else Color(0x1EFFFFFF))
-                                            .clickable { viewModel.setLongExposureStyle(st) }
-                                            .padding(horizontal = 7.dp, vertical = 3.dp)
-                                    ) {
-                                        Text(
-                                            text = st.label,
-                                            color = if (sel) Color.Black else Color.White,
-                                            fontSize = 9.sp,
-                                            fontWeight = FontWeight.Bold,
-                                            fontFamily = FontFamily.Monospace
-                                        )
-                                    }
-                                }
-                            }
-                            Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                                LongExposureState.DURATION_OPTIONS.forEach { sec ->
-                                    val sel = le.durationSec == sec
-                                    Box(
-                                        modifier = Modifier
-                                            .clip(RoundedCornerShape(6.dp))
-                                            .background(if (sel) Color.White else Color(0x1EFFFFFF))
-                                            .clickable { viewModel.setLongExposureDuration(sec) }
-                                            .padding(horizontal = 6.dp, vertical = 3.dp)
-                                    ) {
-                                        Text(
-                                            text = "${sec}s",
-                                            color = if (sel) Color.Black else Color.White,
-                                            fontSize = 9.sp,
-                                            fontWeight = FontWeight.Bold,
-                                            fontFamily = FontFamily.Monospace
-                                        )
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Super Macro Focus Stacking Toggle Bar
-            if (!state.settings.friendMode && state.settings.shootingMode == ShootingMode.SUPER_MACRO) {
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(horizontal = 16.dp, vertical = 4.dp)
-                        .clip(RoundedCornerShape(12.dp))
-                        .background(Color(0xCC0E1014))
-                        .border(0.75.dp, Color(0xFF00E5FF).copy(alpha = 0.45f), RoundedCornerShape(12.dp))
-                        .padding(horizontal = 12.dp, vertical = 7.dp),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Text(
-                        text = if (state.isFocusStacking) "STACKING 5 FOCAL PLANES..." else "SUPER MACRO • 4× LOUPE",
-                        color = Color(0xFF00E5FF),
-                        fontSize = 10.sp,
-                        fontWeight = FontWeight.Bold,
-                        fontFamily = FontFamily.Monospace
-                    )
-                    HudPill(
-                        text = if (state.settings.macroFocusStackEnabled) "FOCUS STACK ON" else "SINGLE SHOT",
-                        accent = if (state.settings.macroFocusStackEnabled) ZeroAiGreen else Color.White,
-                        filled = state.settings.macroFocusStackEnabled,
-                        onClick = { viewModel.toggleMacroFocusStack() }
-                    )
-                }
-            }
-
-            // Stop Motion Onion-Skin Studio Bar
-            if (!state.settings.friendMode && state.settings.shootingMode == ShootingMode.STOP_MO) {
-                val sm = state.stopMotionState
-                Column(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(horizontal = 16.dp, vertical = 4.dp)
-                        .clip(RoundedCornerShape(12.dp))
-                        .background(Color(0xCC0E1014))
-                        .border(0.75.dp, CanonAmber.copy(alpha = 0.5f), RoundedCornerShape(12.dp))
-                        .padding(horizontal = 12.dp, vertical = 7.dp)
-                ) {
-                    if (sm.isExporting) {
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            CircularProgressIndicator(
-                                color = CanonAmber,
-                                strokeWidth = 2.dp,
-                                modifier = Modifier.size(15.dp)
-                            )
-                            Spacer(modifier = Modifier.width(8.dp))
-                            Text(
-                                text = "EXPORTING STOP-MOTION MP4 (${sm.frameCount} FRAMES)...",
-                                color = CanonAmber,
-                                fontSize = 11.sp,
-                                fontWeight = FontWeight.Bold,
-                                fontFamily = FontFamily.Monospace
-                            )
-                        }
-                    } else {
-                        // Row 1: Onion-Skin Toggle + Opacity Slider
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            HudPill(
-                                text = if (sm.onionSkinEnabled) "Ghost On" else "Ghost Off",
-                                accent = if (sm.onionSkinEnabled) CanonAmber else Color.Gray,
-                                filled = sm.onionSkinEnabled,
-                                onClick = { viewModel.toggleStopMotionOnionSkin() }
-                            )
-                            Spacer(modifier = Modifier.width(8.dp))
-                            Slider(
-                                value = sm.onionSkinOpacity,
-                                onValueChange = { viewModel.setStopMotionOpacity(it) },
-                                valueRange = 0.05f..0.95f,
-                                modifier = Modifier.weight(1f).height(24.dp),
-                                colors = SliderDefaults.colors(
-                                    thumbColor = Color.White,
-                                    activeTrackColor = CanonAmber,
-                                    inactiveTrackColor = Color(0x33FFFFFF)
-                                )
-                            )
-                            Text(
-                                text = "${(sm.onionSkinOpacity * 100).toInt()}%",
-                                color = Color.White,
-                                fontSize = 10.sp,
-                                fontFamily = FontFamily.Monospace,
-                                modifier = Modifier.width(34.dp)
-                            )
-                        }
-
-                        Spacer(modifier = Modifier.height(5.dp))
-
-                        // Row 2: Frame counter + FPS picker + UNDO + EXPORT MP4
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.SpaceBetween,
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Text(
-                                text = String.format("%df • %.1fs", sm.frameCount, sm.durationSec),
-                                color = Color.White,
-                                fontSize = 10.sp,
-                                fontWeight = FontWeight.Bold,
-                                fontFamily = FontFamily.Monospace
-                            )
-
-                            Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                                StopMotionState.FPS_OPTIONS.forEach { fps ->
-                                    val sel = sm.fps == fps
-                                    Box(
-                                        modifier = Modifier
-                                            .clip(RoundedCornerShape(5.dp))
-                                            .background(if (sel) Color.White else Color(0x1EFFFFFF))
-                                            .clickable { viewModel.setStopMotionFps(fps) }
-                                            .padding(horizontal = 6.dp, vertical = 3.dp)
-                                    ) {
-                                        Text(
-                                            text = "${fps}p",
-                                            color = if (sel) Color.Black else Color.White,
-                                            fontSize = 9.sp,
-                                            fontWeight = FontWeight.Bold,
-                                            fontFamily = FontFamily.Monospace
-                                        )
-                                    }
-                                }
-                            }
-
-                            Row(horizontalArrangement = Arrangement.spacedBy(5.dp)) {
-                                if (sm.frameCount > 0) {
-                                    Box(
-                                        modifier = Modifier
-                                            .clip(RoundedCornerShape(6.dp))
-                                            .background(Color(0x22FFFFFF))
-                                            .clickable { viewModel.undoStopMotionFrame() }
-                                            .padding(horizontal = 7.dp, vertical = 4.dp)
-                                    ) {
-                                        Text(
-                                            text = "UNDO",
-                                            color = Color.White,
-                                            fontSize = 9.sp,
-                                            fontWeight = FontWeight.Bold,
-                                            fontFamily = FontFamily.Monospace
-                                        )
-                                    }
-                                }
-                                Box(
-                                    modifier = Modifier
-                                        .clip(RoundedCornerShape(6.dp))
-                                        .background(if (sm.frameCount >= 2) ZeroAiGreen else Color(0x18FFFFFF))
-                                        .clickable(enabled = sm.frameCount >= 2) { viewModel.exportStopMotionVideo() }
-                                        .padding(horizontal = 8.dp, vertical = 4.dp)
-                                ) {
-                                    Text(
-                                        text = "EXPORT",
-                                        color = if (sm.frameCount >= 2) Color.Black else Color.Gray,
-                                        fontSize = 9.sp,
-                                        fontWeight = FontWeight.Bold,
-                                        fontFamily = FontFamily.Monospace
-                                    )
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Document Scanner Control Bar
-            if (!state.settings.friendMode && state.settings.shootingMode == ShootingMode.SCAN_DOC) {
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(horizontal = 16.dp, vertical = 4.dp)
-                        .clip(RoundedCornerShape(12.dp))
-                        .background(Color(0xCC0E1014))
-                        .border(0.75.dp, ZeroAiGreen.copy(alpha = 0.5f), RoundedCornerShape(12.dp))
-                        .padding(horizontal = 12.dp, vertical = 7.dp),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    if (state.isScanningDocument) {
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            CircularProgressIndicator(
-                                color = ZeroAiGreen,
-                                strokeWidth = 2.dp,
-                                modifier = Modifier.size(15.dp)
-                            )
-                            Spacer(modifier = Modifier.width(8.dp))
-                            Text(
-                                text = "ENHANCING & SAVING PDF...",
-                                color = ZeroAiGreen,
-                                fontSize = 11.sp,
-                                fontWeight = FontWeight.Bold,
-                                fontFamily = FontFamily.Monospace
-                            )
-                        }
-                    } else {
-                        Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                            DocumentScanStyle.entries.forEach { style ->
-                                val sel = state.settings.scanStyle == style
-                                Box(
-                                    modifier = Modifier
-                                        .clip(RoundedCornerShape(7.dp))
-                                        .background(if (sel) ZeroAiGreen else Color(0x1EFFFFFF))
-                                        .clickable { viewModel.setScanStyle(style) }
-                                        .padding(horizontal = 9.dp, vertical = 4.dp)
-                                ) {
-                                    Text(
-                                        text = style.label,
-                                        color = if (sel) Color.Black else Color.White,
-                                        fontSize = 10.sp,
-                                        fontWeight = FontWeight.Bold,
-                                        fontFamily = FontFamily.Monospace
-                                    )
-                                }
-                            }
-                        }
-                        Text(
-                            text = "PDF + JPG",
-                            color = Color(0xFFA0A4AE),
-                            fontSize = 10.sp,
-                            fontFamily = FontFamily.Monospace
-                        )
-                    }
-                }
-            }
-
-            // Panorama Sweep Guide Bar
-            if (!state.settings.friendMode && state.settings.shootingMode == ShootingMode.PANORAMA) {
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(horizontal = 16.dp, vertical = 4.dp)
-                        .clip(RoundedCornerShape(12.dp))
-                        .background(Color(0xCC0E1014))
-                        .border(0.75.dp, CanonAmber.copy(alpha = 0.5f), RoundedCornerShape(12.dp))
-                        .padding(horizontal = 12.dp, vertical = 8.dp),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    if (state.panoramaState.isStitching) {
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            CircularProgressIndicator(
-                                color = CanonAmber,
-                                strokeWidth = 2.dp,
-                                modifier = Modifier.size(16.dp)
-                            )
-                            Spacer(modifier = Modifier.width(8.dp))
-                            Text(
-                                text = "STITCHING PANORAMA...",
-                                color = CanonAmber,
-                                fontSize = 11.sp,
-                                fontWeight = FontWeight.Bold,
-                                fontFamily = FontFamily.Monospace
-                            )
-                        }
-                    } else if (state.panoramaState.isCapturing) {
-                        Text(
-                            text = "PANORAMA • ${state.panoramaState.frameCount} FRAMES • ${state.panoramaState.accumulatedYawDeg.toInt()}°",
-                            color = Color.White,
-                            fontSize = 11.sp,
-                            fontWeight = FontWeight.SemiBold
-                        )
-                        Box(
-                            modifier = Modifier
-                                .clip(RoundedCornerShape(8.dp))
-                                .background(CanonAmber)
-                                .clickable { viewModel.captureNextPanoramaFrame() }
-                                .padding(horizontal = 10.dp, vertical = 5.dp)
-                        ) {
-                            Text(
-                                text = "+ FRAME",
-                                color = Color.Black,
-                                fontSize = 10.sp,
-                                fontWeight = FontWeight.Bold,
-                                fontFamily = FontFamily.Monospace
-                            )
-                        }
-                    } else {
-                        Text(
-                            text = "PANORAMA • Tap shutter to start sweep (AE/WB locked)",
-                            color = Color.White.copy(alpha = 0.85f),
-                            fontSize = 11.sp,
-                            fontFamily = FontFamily.Monospace
-                        )
-                    }
-                }
-            }
-
-            // Time-Lapse Intervalometer Control Bar
-            if (!state.settings.friendMode && state.settings.shootingMode == ShootingMode.TIMELAPSE) {
-                val tl = state.timeLapseState
-                Column(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(horizontal = 16.dp, vertical = 4.dp)
-                        .clip(RoundedCornerShape(12.dp))
-                        .background(Color(0xCC0E1014))
-                        .border(0.75.dp, if (tl.isRunning) CanonRed else Color.White.copy(alpha = 0.18f), RoundedCornerShape(12.dp))
-                        .padding(horizontal = 12.dp, vertical = 8.dp)
-                ) {
-                    if (tl.isRunning) {
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.SpaceBetween
-                        ) {
-                            Text(
-                                text = "REC • ${tl.formattedElapsed()}",
-                                color = CanonRed,
-                                fontSize = 12.sp,
-                                fontWeight = FontWeight.Bold,
-                                fontFamily = FontFamily.Monospace
-                            )
-                            Text(
-                                text = if (tl.targetFrames > 0) "${tl.capturedFrames}/${tl.targetFrames} FRAMES" else "${tl.capturedFrames} FRAMES",
-                                color = Color.White,
-                                fontSize = 11.sp,
-                                fontFamily = FontFamily.Monospace
-                            )
-                        }
-                    } else {
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.SpaceBetween,
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Text("INTERVAL", color = Color(0xFFA0A4AE), fontSize = 10.sp, fontFamily = FontFamily.Monospace)
-                            Row(horizontalArrangement = Arrangement.spacedBy(5.dp)) {
-                                TimeLapseState.INTERVAL_OPTIONS.forEach { sec ->
-                                    val sel = tl.intervalSeconds == sec
-                                    Box(
-                                        modifier = Modifier
-                                            .clip(RoundedCornerShape(6.dp))
-                                            .background(if (sel) CanonAmber else Color(0x1EFFFFFF))
-                                            .clickable { viewModel.setTimeLapseInterval(sec) }
-                                            .padding(horizontal = 7.dp, vertical = 3.dp)
-                                    ) {
-                                        Text("${sec}s", color = if (sel) Color.Black else Color.White, fontSize = 10.sp, fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace)
-                                    }
-                                }
-                            }
-                        }
-                        Spacer(modifier = Modifier.height(6.dp))
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.SpaceBetween,
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Text("FRAMES", color = Color(0xFFA0A4AE), fontSize = 10.sp, fontFamily = FontFamily.Monospace)
-                            Row(horizontalArrangement = Arrangement.spacedBy(5.dp)) {
-                                TimeLapseState.FRAME_OPTIONS.forEach { cnt ->
-                                    val sel = tl.targetFrames == cnt
-                                    Box(
-                                        modifier = Modifier
-                                            .clip(RoundedCornerShape(6.dp))
-                                            .background(if (sel) Color.White else Color(0x1EFFFFFF))
-                                            .clickable { viewModel.setTimeLapseTargetFrames(cnt) }
-                                            .padding(horizontal = 7.dp, vertical = 3.dp)
-                                    ) {
-                                        Text(if (cnt == 0) "∞" else "$cnt", color = if (sel) Color.Black else Color.White, fontSize = 10.sp, fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace)
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
                 } // end Bottom-of-Viewfinder Panels Column
             } // end Top-Aligned 1:1 Viewfinder BoxWithConstraints
 
@@ -1691,13 +1576,26 @@ fun CameraScreen(
                         )
                     }
 
-                    // Clean Primary Mode Strip ABOVE Shutter: PHOTO | VIDEO | DUAL | (active More mode) | MORE
-                    val primaryModes = listOf(ShootingMode.PHOTO, ShootingMode.VIDEO, ShootingMode.DUAL)
+                    // Clean Primary Mode Strip ABOVE Shutter: PHOTO | VIDEO | PORTRAIT | DUAL | MORE (Swipeable!)
+                    val primaryModes = listOf(ShootingMode.PHOTO, ShootingMode.VIDEO, ShootingMode.PORTRAIT, ShootingMode.DUAL)
                     val isExtraModeActive = state.settings.shootingMode !in primaryModes
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .padding(horizontal = 24.dp, vertical = 6.dp),
+                            .pointerInput(state.isVideoRecording) {
+                                if (!state.isVideoRecording) {
+                                    var stripAccum = 0f
+                                    detectHorizontalDragGestures(
+                                        onDragStart = { stripAccum = 0f },
+                                        onHorizontalDrag = { _, dx -> stripAccum += dx },
+                                        onDragEnd = {
+                                            if (stripAccum < -60f) viewModel.swipePrimaryMode(+1)
+                                            else if (stripAccum > 60f) viewModel.swipePrimaryMode(-1)
+                                        }
+                                    )
+                                }
+                            }
+                            .padding(horizontal = 16.dp, vertical = 6.dp),
                         horizontalArrangement = Arrangement.SpaceEvenly,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
@@ -1705,52 +1603,55 @@ fun CameraScreen(
                             val selected = !showMoreModes && state.settings.shootingMode == mode
                             Text(
                                 text = mode.label,
-                                color = if (selected) TrueLensPalette.AccentViolet else Color.White.copy(alpha = 0.88f),
-                                fontSize = 12.sp,
+                                color = if (selected) hudAccent else if (astroRed) Color(0x99EF4444) else Color.White.copy(alpha = 0.88f),
+                                fontSize = 11.5.sp,
                                 fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium,
-                                letterSpacing = 0.8.sp,
+                                letterSpacing = 0.6.sp,
                                 modifier = Modifier
                                     .clickable {
                                         showMoreModes = false
                                         viewModel.setShootingMode(mode)
                                     }
-                                    .padding(horizontal = 8.dp, vertical = 4.dp)
+                                    .padding(horizontal = 6.dp, vertical = 4.dp)
                             )
                         }
                         if (isExtraModeActive && !showMoreModes) {
                             Text(
                                 text = state.settings.shootingMode.label,
-                                color = TrueLensPalette.AccentViolet,
-                                fontSize = 11.sp,
+                                color = hudAccent,
+                                fontSize = 10.5.sp,
                                 fontWeight = FontWeight.Bold,
-                                letterSpacing = 0.5.sp,
+                                letterSpacing = 0.4.sp,
                                 maxLines = 1,
                                 modifier = Modifier
                                     .clickable { showMoreModes = true }
-                                    .padding(horizontal = 6.dp, vertical = 4.dp)
+                                    .padding(horizontal = 4.dp, vertical = 4.dp)
                             )
                         }
                         Text(
                             text = "MORE",
-                            color = if (showMoreModes) TrueLensPalette.AccentViolet else Color.White.copy(alpha = 0.88f),
-                            fontSize = 12.sp,
+                            color = if (showMoreModes) hudAccent else if (astroRed) Color(0x99EF4444) else Color.White.copy(alpha = 0.88f),
+                            fontSize = 11.5.sp,
                             fontWeight = if (showMoreModes) FontWeight.Bold else FontWeight.Medium,
-                            letterSpacing = 0.8.sp,
+                            letterSpacing = 0.6.sp,
                             modifier = Modifier
                                 .clickable {
                                     showQuickTools = false
                                     viewModel.setActiveDeck(ActiveDeck.NONE)
                                     showMoreModes = !showMoreModes
                                 }
-                                .padding(horizontal = 8.dp, vertical = 4.dp)
+                                .padding(horizontal = 6.dp, vertical = 4.dp)
                         )
                     }
                 }
 
-                // Ultra-Clean 3-Button Shutter Dock (Circular Gallery | Shutter | Flip Camera)
-                val isRecordingMode = state.isVideoRecording || state.panoramaState.isCapturing || state.timeLapseState.isRunning
+                // Ultra-Clean 3-Button Shutter Dock:
+                // Idle: Gallery | Shutter | Flip
+                // Recording Video: Snap Photo Mid-Video | Stop | Pause/Resume!
+                val isRecordingMode = state.isVideoRecording || state.panoramaState.isCapturing || state.timeLapseState.isRunning || state.isAstroCapturing
                 val isVideoRedShutter = state.settings.shootingMode == ShootingMode.VIDEO ||
-                    state.settings.shootingMode == ShootingMode.SLOW_MO
+                    state.settings.shootingMode == ShootingMode.SLOW_MO ||
+                    state.settings.shootingMode == ShootingMode.CINEMATIC
                 if (!showMoreModes) {
                     Row(
                         modifier = Modifier
@@ -1759,63 +1660,86 @@ fun CameraScreen(
                         horizontalArrangement = Arrangement.SpaceBetween,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        // Left: Circular Gallery Thumbnail (Photos & Videos — shows subtle play badge for Videos!)
-                        Box(
-                            modifier = Modifier
-                                .size(48.dp)
-                                .clip(CircleShape)
-                                .background(Color(0xFF1A1B22))
-                                .border(
-                                    1.dp,
-                                    Color.White.copy(alpha = if (state.lastThumbnail != null) 0.55f else 0.18f),
-                                    CircleShape
-                                )
-                                .clickable { viewModel.openGallery() },
-                            contentAlignment = Alignment.Center
-                        ) {
-                            if (state.lastThumbnail != null) {
-                                Image(
-                                    bitmap = state.lastThumbnail!!.asImageBitmap(),
-                                    contentDescription = "Open Gallery",
-                                    contentScale = ContentScale.Crop,
-                                    modifier = Modifier.fillMaxSize()
-                                )
-                                if (state.lastThumbnailIsVideo) {
-                                    Box(
-                                        modifier = Modifier
-                                            .size(22.dp)
-                                            .clip(CircleShape)
-                                            .background(Color.Black.copy(alpha = 0.58f)),
-                                        contentAlignment = Alignment.Center
-                                    ) {
-                                        Icon(
-                                            imageVector = Icons.Default.PlayArrow,
-                                            contentDescription = "Latest Video",
-                                            tint = Color.White,
-                                            modifier = Modifier.size(14.dp)
-                                        )
-                                    }
-                                }
-                            } else {
+                        // Left: While filming -> Snap Still Photo button; otherwise Circular Gallery Thumbnail!
+                        if (state.isVideoRecording) {
+                            Box(
+                                modifier = Modifier
+                                    .size(48.dp)
+                                    .clip(CircleShape)
+                                    .background(Color.White)
+                                    .border(2.dp, Color.White.copy(alpha = 0.55f), CircleShape)
+                                    .clickable {
+                                        haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                        viewModel.captureMidVideoSnapshot()
+                                    },
+                                contentAlignment = Alignment.Center
+                            ) {
                                 Icon(
-                                    imageVector = Icons.Default.PhotoLibrary,
-                                    contentDescription = "Gallery",
-                                    tint = Color.White.copy(alpha = 0.7f),
-                                    modifier = Modifier.size(21.dp)
+                                    imageVector = Icons.Default.PhotoCamera,
+                                    contentDescription = "Snap Photo While Recording",
+                                    tint = Color.Black,
+                                    modifier = Modifier.size(22.dp)
                                 )
+                            }
+                        } else {
+                            Box(
+                                modifier = Modifier
+                                    .size(48.dp)
+                                    .clip(CircleShape)
+                                    .background(Color(0xFF1A1B22))
+                                    .border(
+                                        1.dp,
+                                        Color.White.copy(alpha = if (state.lastThumbnail != null) 0.55f else 0.18f),
+                                        CircleShape
+                                    )
+                                    .clickable { viewModel.openGallery() },
+                                contentAlignment = Alignment.Center
+                            ) {
+                                if (state.lastThumbnail != null) {
+                                    Image(
+                                        bitmap = state.lastThumbnail!!.asImageBitmap(),
+                                        contentDescription = "Open Gallery",
+                                        contentScale = ContentScale.Crop,
+                                        modifier = Modifier.fillMaxSize()
+                                    )
+                                    if (state.lastThumbnailIsVideo) {
+                                        Box(
+                                            modifier = Modifier
+                                                .size(22.dp)
+                                                .clip(CircleShape)
+                                                .background(Color.Black.copy(alpha = 0.58f)),
+                                            contentAlignment = Alignment.Center
+                                        ) {
+                                            Icon(
+                                                imageVector = Icons.Default.PlayArrow,
+                                                contentDescription = "Latest Video",
+                                                tint = Color.White,
+                                                modifier = Modifier.size(14.dp)
+                                            )
+                                        }
+                                    }
+                                } else {
+                                    Icon(
+                                        imageVector = Icons.Default.PhotoLibrary,
+                                        contentDescription = "Gallery",
+                                        tint = Color.White.copy(alpha = 0.7f),
+                                        modifier = Modifier.size(21.dp)
+                                    )
+                                }
                             }
                         }
 
-                        // Center: Clean Mechanical Shutter (White in Photo, Coral Red in Video/Slow-Mo!)
+                        // Center: Clean Mechanical Shutter (White in Photo, Coral Red in Video, Deep Crimson in Astro Red UI!)
                         Box(
                             modifier = Modifier
                                 .size(72.dp)
                                 .clip(CircleShape)
-                                .border(3.dp, Color.White, CircleShape)
+                                .border(3.dp, if (astroRed) Color(0xFFDC2626) else Color.White, CircleShape)
                                 .padding(5.dp)
                                 .clip(CircleShape)
                                 .background(
                                     when {
+                                        astroRed -> Color(0xFF991B1B)
                                         isRecordingMode || isVideoRedShutter -> TrueLensPalette.RecordCoral
                                         else -> Color.White
                                     }
@@ -1836,26 +1760,190 @@ fun CameraScreen(
                             }
                         }
 
-                        // Right: Clean Circular Front ↔ Back Camera Flip Button
-                        Box(
-                            modifier = Modifier
-                                .size(48.dp)
-                                .clip(CircleShape)
-                                .background(Color(0xFF1A1B22))
-                                .border(0.75.dp, Color.White.copy(alpha = 0.16f), CircleShape)
-                                .clickable { viewModel.flipFrontBackCamera() },
-                            contentAlignment = Alignment.Center
-                        ) {
-                            Icon(
-                                imageVector = Icons.Default.Cameraswitch,
-                                contentDescription = "Flip Camera",
-                                tint = Color.White,
-                                modifier = Modifier.size(22.dp)
-                            )
+                        // Right: While filming -> Pause / Resume button; otherwise Front ↔ Back Camera Flip!
+                        if (state.isVideoRecording) {
+                            Box(
+                                modifier = Modifier
+                                    .size(48.dp)
+                                    .clip(CircleShape)
+                                    .background(if (state.isVideoPaused) Color(0xFFFFB300) else Color(0xFF1A1B22))
+                                    .border(
+                                        1.dp,
+                                        if (state.isVideoPaused) Color(0xFFFFB300) else Color.White.copy(alpha = 0.25f),
+                                        CircleShape
+                                    )
+                                    .clickable { viewModel.togglePauseVideoRecording() },
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Icon(
+                                    imageVector = if (state.isVideoPaused) Icons.Default.PlayArrow else Icons.Default.Pause,
+                                    contentDescription = if (state.isVideoPaused) "Resume Recording" else "Pause Recording",
+                                    tint = if (state.isVideoPaused) Color.Black else Color.White,
+                                    modifier = Modifier.size(24.dp)
+                                )
+                            }
+                        } else {
+                            Box(
+                                modifier = Modifier
+                                    .size(48.dp)
+                                    .clip(CircleShape)
+                                    .background(Color(0xFF1A1B22))
+                                    .border(0.75.dp, Color.White.copy(alpha = 0.16f), CircleShape)
+                                    .clickable { viewModel.flipFrontBackCamera() },
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.Cameraswitch,
+                                    contentDescription = "Flip Camera",
+                                    tint = Color.White,
+                                    modifier = Modifier.size(22.dp)
+                                )
+                            }
                         }
                     }
                 } else {
                     Spacer(modifier = Modifier.height(18.dp))
+                }
+            }
+        }
+
+        // Feature #8: Translucent Live Text Inspector Sheet (Copy / Call / Open Link / Email / Translate)
+        val liveText = state.detectedLiveText
+        if (state.isLiveTextSheetOpen && liveText != null) {
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(Color(0xA6000000))
+                    .pointerInput(Unit) { detectTapGestures { viewModel.closeLiveTextSheet() } },
+                contentAlignment = Alignment.BottomCenter
+            ) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .navigationBarsPadding()
+                        .padding(16.dp)
+                        .clip(RoundedCornerShape(24.dp))
+                        .background(Color(0xF212131A))
+                        .border(0.75.dp, TrueLensPalette.GlassBorder, RoundedCornerShape(24.dp))
+                        .pointerInput(Unit) { detectTapGestures { } }
+                        .padding(16.dp),
+                    verticalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Icon(
+                                imageVector = Icons.Default.TextFields,
+                                contentDescription = null,
+                                tint = Color(0xFFFFD60A),
+                                modifier = Modifier.size(18.dp)
+                            )
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Text(
+                                text = "Live Text (${liveText.lineCount} lines)",
+                                color = Color.White,
+                                fontSize = 15.sp,
+                                fontWeight = FontWeight.SemiBold
+                            )
+                        }
+                        Icon(
+                            imageVector = Icons.Default.Close,
+                            contentDescription = "Close",
+                            tint = Color.White.copy(alpha = 0.75f),
+                            modifier = Modifier
+                                .size(22.dp)
+                                .clickable { viewModel.closeLiveTextSheet() }
+                        )
+                    }
+
+                    SelectionContainer {
+                        Text(
+                            text = liveText.fullText,
+                            color = Color.White.copy(alpha = 0.92f),
+                            fontSize = 13.sp,
+                            lineHeight = 19.sp,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(140.dp)
+                                .clip(RoundedCornerShape(14.dp))
+                                .background(Color(0xFF0A0B0F))
+                                .verticalScroll(rememberScrollState())
+                                .padding(12.dp)
+                        )
+                    }
+
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .horizontalScroll(rememberScrollState()),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        GlassChip(
+                            text = "Copy All",
+                            accent = Color(0xFFFFD60A),
+                            active = true,
+                            onClick = {
+                                copyToClipboard(context, "Live Text", liveText.fullText)
+                                viewModel.closeLiveTextSheet()
+                            }
+                        )
+                        if (liveText.firstUrl != null) {
+                            GlassChip(
+                                text = "Open Link",
+                                accent = TrueLensPalette.AccentViolet,
+                                active = true,
+                                onClick = {
+                                    runCatching {
+                                        context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(liveText.firstUrl)))
+                                    }
+                                    viewModel.closeLiveTextSheet()
+                                }
+                            )
+                        }
+                        if (liveText.firstPhone != null) {
+                            GlassChip(
+                                text = "Call",
+                                accent = Color(0xFF34D399),
+                                active = true,
+                                onClick = {
+                                    runCatching {
+                                        context.startActivity(Intent(Intent.ACTION_DIAL, Uri.parse("tel:${liveText.firstPhone}")))
+                                    }
+                                    viewModel.closeLiveTextSheet()
+                                }
+                            )
+                        }
+                        if (liveText.firstEmail != null) {
+                            GlassChip(
+                                text = "Email",
+                                accent = Color.White,
+                                active = false,
+                                onClick = {
+                                    runCatching {
+                                        context.startActivity(Intent(Intent.ACTION_SENDTO, Uri.parse("mailto:${liveText.firstEmail}")))
+                                    }
+                                    viewModel.closeLiveTextSheet()
+                                }
+                            )
+                        }
+                        GlassChip(
+                            text = "Translate",
+                            accent = Color.White,
+                            active = false,
+                            onClick = {
+                                val encoded = Uri.encode(liveText.fullText.take(400))
+                                runCatching {
+                                    context.startActivity(
+                                        Intent(Intent.ACTION_VIEW, Uri.parse("https://translate.google.com/?sl=auto&tl=en&text=$encoded"))
+                                    )
+                                }
+                                viewModel.closeLiveTextSheet()
+                            }
+                        )
+                    }
                 }
             }
         }
@@ -1875,6 +1963,45 @@ fun CameraScreen(
         ) {
             Box(modifier = Modifier.fillMaxSize().background(Color(0xFFFFF8EE)))
         }
+    }
+}
+
+private fun copyToClipboard(context: Context, label: String, text: String) {
+    val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+    cm?.setPrimaryClip(ClipData.newPlainText(label, text))
+    Toast.makeText(context, "Copied to clipboard", Toast.LENGTH_SHORT).show()
+}
+
+private fun handleQrCodeAction(context: Context, qr: com.truelens.camera.modes.DetectedQrCode) {
+    try {
+        when (qr.actionType) {
+            com.truelens.camera.modes.QrActionType.URL -> {
+                val url = if (qr.rawValue.contains("://")) qr.rawValue else "https://${qr.rawValue}"
+                context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
+            }
+            com.truelens.camera.modes.QrActionType.PHONE -> {
+                context.startActivity(Intent(Intent.ACTION_DIAL, Uri.parse("tel:${qr.rawValue}")))
+            }
+            com.truelens.camera.modes.QrActionType.EMAIL -> {
+                context.startActivity(Intent(Intent.ACTION_SENDTO, Uri.parse("mailto:${qr.rawValue}")))
+            }
+            com.truelens.camera.modes.QrActionType.SMS -> {
+                val target = qr.rawValue.removePrefix("smsto:").removePrefix("SMSTO:").substringBefore(":")
+                context.startActivity(Intent(Intent.ACTION_SENDTO, Uri.parse("smsto:$target")))
+            }
+            com.truelens.camera.modes.QrActionType.WIFI -> {
+                if (!qr.wifiPassword.isNullOrBlank()) {
+                    copyToClipboard(context, "Wi-Fi Password", qr.wifiPassword)
+                    Toast.makeText(context, "Copied Wi-Fi password for ${qr.wifiSsid}", Toast.LENGTH_LONG).show()
+                }
+                context.startActivity(Intent(Settings.ACTION_WIFI_SETTINGS))
+            }
+            com.truelens.camera.modes.QrActionType.TEXT -> {
+                copyToClipboard(context, "QR Code", qr.rawValue)
+            }
+        }
+    } catch (_: Exception) {
+        copyToClipboard(context, "QR Code", qr.rawValue)
     }
 }
 
@@ -1942,7 +2069,7 @@ private fun GlassCircleButton(
 }
 
 @Composable
-private fun HudPill(
+internal fun HudPill(
     text: String,
     accent: Color,
     filled: Boolean,
@@ -2035,6 +2162,62 @@ private fun DeckToggleButton(
             color = if (active) CanonAmber else Color.White.copy(alpha = 0.9f),
             fontSize = 10.sp,
             fontWeight = FontWeight.Medium
+        )
+    }
+}
+
+/**
+ * Sleek segmented Real-Time Audio Level Meter (dB Bars) for Video / Cinematic mode.
+ * Green (-54..-16 dB) -> Amber (-16..-6 dB) -> Red clipping (-6..0 dB).
+ */
+@Composable
+internal fun LiveAudioLevelMeterRow(
+    level01: Float,
+    peakDb: Float,
+    muted: Boolean
+) {
+    val segCount = 20
+    val litCount = if (muted) 0 else (level01 * segCount).roundToInt().coerceIn(0, segCount)
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(6.dp)
+    ) {
+        Text(
+            text = "MIC",
+            color = if (muted) TrueLensPalette.RecordCoral else TrueLensPalette.MutedGray,
+            fontSize = 9.sp,
+            fontWeight = FontWeight.Bold,
+            fontFamily = FontFamily.Monospace
+        )
+        Row(
+            modifier = Modifier.weight(1f).height(8.dp),
+            horizontalArrangement = Arrangement.spacedBy(2.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            for (i in 0 until segCount) {
+                val active = i < litCount
+                val segColor = when {
+                    !active -> Color(0x22FFFFFF)
+                    i >= 17 -> Color(0xFFEF4444) // Clipping red
+                    i >= 13 -> Color(0xFFF59E0B) // Hot amber
+                    else -> Color(0xFF22C55E)    // Healthy green
+                }
+                Box(
+                    modifier = Modifier
+                        .weight(1f)
+                        .height(8.dp)
+                        .clip(RoundedCornerShape(2.dp))
+                        .background(segColor)
+                )
+            }
+        }
+        Text(
+            text = if (muted) "MUTED" else String.format(java.util.Locale.US, "%+.0fdB", peakDb.coerceIn(-60f, 0f)),
+            color = if (muted || peakDb > -6f) Color(0xFFEF4444) else Color.White.copy(alpha = 0.85f),
+            fontSize = 9.sp,
+            fontWeight = FontWeight.Bold,
+            fontFamily = FontFamily.Monospace
         )
     }
 }

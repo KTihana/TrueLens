@@ -168,6 +168,68 @@ object BitmapGrader {
                     b += noise
                 }
 
+                // 9. Optional Film Halation Highlight Bloom (CineStill-style red/orange glow on bright highlights)
+                if (grade.halation > 0.01f) {
+                    val lumaH = 0.2126f * r + 0.7152f * g + 0.0722f * b
+                    if (lumaH > 0.68f) {
+                        val halo = ((lumaH - 0.68f) / 0.32f).coerceIn(0f, 1f) * grade.halation * 0.42f
+                        r += halo
+                        g += halo * 0.30f
+                        b += halo * 0.08f
+                    }
+                }
+
+                // 10. Optional Analog Film Light Leaks (5 unique styles matching live OpenGL shader!)
+                if (grade.lightLeakStyle > 0 && grade.lightLeakIntensity > 0.01f) {
+                    val ux = x * invW
+                    val uy = 1f - y * invH
+                    val amt = grade.lightLeakIntensity
+                    var lr = 0f; var lg = 0f; var lb = 0f
+                    when (grade.lightLeakStyle) {
+                        1 -> {
+                            val t = (ux - 0.04f) * 3.8f
+                            val w1 = kotlin.math.exp((-t * t).toDouble()).toFloat() * (0.65f + 0.35f * kotlin.math.sin(uy * Math.PI).toFloat())
+                            lr = 1.0f * w1 * 0.72f; lg = 0.36f * w1 * 0.72f; lb = 0.08f * w1 * 0.72f
+                        }
+                        2 -> {
+                            val dx = (ux - 0.92f) * 1.3f; val dy = (uy - 0.88f) * 1.1f
+                            val w2 = kotlin.math.exp((-(dx * dx + dy * dy) * 5.2).toDouble()).toFloat()
+                            lr = 1.0f * w2 * 0.78f; lg = 0.54f * w2 * 0.78f; lb = 0.12f * w2 * 0.78f
+                        }
+                        3 -> {
+                            val diag = abs((ux * 0.85f + uy * 0.55f) - 0.36f)
+                            val w3 = kotlin.math.exp((-diag * diag * 16.0).toDouble()).toFloat()
+                            lr = 0.98f * w3 * 0.58f; lg = 0.34f * w3 * 0.58f; lb = 0.52f * w3 * 0.58f
+                        }
+                        4 -> {
+                            val tx = (ux - 0.94f) * 4.2f; val ty = (uy - 0.48f) * 1.6f
+                            val w4 = kotlin.math.exp((-(tx * tx + ty * ty)).toDouble()).toFloat()
+                            lr = 1.0f * w4 * 0.75f; lg = 0.72f * w4 * 0.75f; lb = 0.22f * w4 * 0.75f
+                        }
+                        else -> {
+                            val txL = ux * 4.2f; val txR = (1f - ux) * 4.2f
+                            val wl = kotlin.math.exp((-txL * txL).toDouble()).toFloat()
+                            val wr = kotlin.math.exp((-txR * txR).toDouble()).toFloat()
+                            lr = 1.0f * wl * 0.62f + 1.0f * wr * 0.52f
+                            lg = 0.30f * wl * 0.62f + 0.62f * wr * 0.52f
+                            lb = 0.08f * wl * 0.62f + 0.16f * wr * 0.52f
+                        }
+                    }
+                    val cr = (lr * amt).coerceIn(0f, 0.95f)
+                    val cg = (lg * amt).coerceIn(0f, 0.95f)
+                    val cb = (lb * amt).coerceIn(0f, 0.95f)
+                    r = 1f - (1f - r.coerceIn(0f, 1f)) * (1f - cr)
+                    g = 1f - (1f - g.coerceIn(0f, 1f)) * (1f - cg)
+                    b = 1f - (1f - b.coerceIn(0f, 1f)) * (1f - cb)
+                }
+
+                // 11. Optional 90s VHS Retro Scanlines
+                if (grade.vhsRetro > 0.01f) {
+                    val scan = 0.5f + 0.5f * kotlin.math.sin((y.toFloat() * invH * 540.0)).toFloat()
+                    val mul = 1f - 0.11f * grade.vhsRetro * scan
+                    r *= mul; g *= mul; b *= mul
+                }
+
                 val ri = (r.coerceIn(0f, 1f) * 255.0f + 0.5f).toInt()
                 val gi = (g.coerceIn(0f, 1f) * 255.0f + 0.5f).toInt()
                 val bi = (b.coerceIn(0f, 1f) * 255.0f + 0.5f).toInt()
@@ -220,5 +282,89 @@ object BitmapGrader {
         val canvas = Canvas(out)
         canvas.drawBitmap(source, matrix, Paint(Paint.FILTER_BITMAP_FLAG or Paint.ANTI_ALIAS_FLAG))
         return out
+    }
+
+    /**
+     * Optional Clean Enhance pass (OFF by default — Pure Zero-AI remains default!).
+     * Applies gentle edge-preserving 3×3 bilateral-style noise reduction in smooth regions
+     * plus subtle optical micro-sharpening along real edges so photos look cleaner and crisper
+     * without plastic skin-smoothing or over-sharpened halos.
+     */
+    fun applyCleanEnhance(source: Bitmap): Bitmap {
+        val w = source.width
+        val h = source.height
+        if (w < 8 || h < 8) return source
+        val src = IntArray(w * h)
+        source.getPixels(src, 0, w, 0, 0, w, h)
+        val out = IntArray(w * h)
+        System.arraycopy(src, 0, out, 0, src.size)
+
+        // Subtle edge-preserving denoise + gentle micro-clarity
+        val sigmaColor = 26 // pixels closer than this in intensity get gently denoised; real edges stay crisp
+        val sharpAmt = 0.24f
+
+        for (y in 1 until h - 1) {
+            val row = y * w
+            val rowUp = (y - 1) * w
+            val rowDn = (y + 1) * w
+            for (x in 1 until w - 1) {
+                val c = src[row + x]
+                val cr = (c shr 16) and 0xFF
+                val cg = (c shr 8) and 0xFF
+                val cb = c and 0xFF
+
+                val n1 = src[rowUp + x]
+                val n2 = src[rowDn + x]
+                val n3 = src[row + x - 1]
+                val n4 = src[row + x + 1]
+
+                var sumR = cr * 2
+                var sumG = cg * 2
+                var sumB = cb * 2
+                var wSum = 2
+
+                // Edge-aware neighbor accumulation
+                val neighbors = intArrayOf(n1, n2, n3, n4)
+                var avgR = cr
+                var avgG = cg
+                var avgB = cb
+                for (nb in neighbors) {
+                    val nr = (nb shr 16) and 0xFF
+                    val ng = (nb shr 8) and 0xFF
+                    val nbB = nb and 0xFF
+                    avgR += nr
+                    avgG += ng
+                    avgB += nbB
+                    val diff = abs(nr - cr) + abs(ng - cg) + abs(nbB - cb)
+                    if (diff < sigmaColor * 3) {
+                        sumR += nr
+                        sumG += ng
+                        sumB += nbB
+                        wSum += 1
+                    }
+                }
+
+                // Gentle denoised pixel
+                val denR = sumR.toFloat() / wSum
+                val denG = sumG.toFloat() / wSum
+                val denB = sumB.toFloat() / wSum
+
+                // Restrained unsharp-mask micro-crispness (clamped to avoid halos)
+                val meanR = avgR / 5f
+                val meanG = avgG / 5f
+                val meanB = avgB / 5f
+                val detailR = (denR - meanR).coerceIn(-18f, 18f)
+                val detailG = (denG - meanG).coerceIn(-18f, 18f)
+                val detailB = (denB - meanB).coerceIn(-18f, 18f)
+
+                val fr = (denR + detailR * sharpAmt).toInt().coerceIn(0, 255)
+                val fg = (denG + detailG * sharpAmt).toInt().coerceIn(0, 255)
+                val fb = (denB + detailB * sharpAmt).toInt().coerceIn(0, 255)
+
+                out[row + x] = (0xFF shl 24) or (fr shl 16) or (fg shl 8) or fb
+            }
+        }
+
+        return Bitmap.createBitmap(out, w, h, Bitmap.Config.ARGB_8888)
     }
 }

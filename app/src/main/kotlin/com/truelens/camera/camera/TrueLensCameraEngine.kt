@@ -467,11 +467,24 @@ class TrueLensCameraEngine(
                 videoWidth = standardChosen.width
                 videoHeight = standardChosen.height
             }
-            // Validate 60fps against camera AE target FPS ranges so unsupported hardware falls back cleanly to 30fps
-            if (!isSlowMo && captureFps > 30) {
+            // Validate target FPS (24fps cinema or 60fps smooth) against hardware AE target FPS ranges
+            var chosenFpsRange: Range<Int>? = null
+            if (!isSlowMo) {
                 val fpsRanges = chars?.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES)
-                val supports60 = fpsRanges?.any { it.upper >= 60 } == true
-                if (!supports60) captureFps = 30
+                if (captureFps == 24) {
+                    val exact24 = fpsRanges?.firstOrNull { it.lower == 24 && it.upper == 24 }
+                        ?: fpsRanges?.firstOrNull { it.lower <= 24 && it.upper == 24 }
+                    if (exact24 != null) {
+                        chosenFpsRange = exact24
+                    } else {
+                        // Hardware doesn't expose 24fps AE range: still encode smooth 24fps container!
+                        chosenFpsRange = fpsRanges?.firstOrNull { it.upper == 30 }
+                    }
+                } else if (captureFps > 30) {
+                    val supports60 = fpsRanges?.any { it.upper >= 60 } == true
+                    if (!supports60) captureFps = 30
+                    else chosenFpsRange = fpsRanges?.firstOrNull { it.upper >= 60 }
+                }
             }
 
             if (isSlowMo && map != null) {
@@ -512,9 +525,20 @@ class TrueLensCameraEngine(
                 MediaRecorder()
             }
 
-            val recordAudio = hasAudioPermission && !isSlowMo && !settings.micMuted
+            val audioMode = if (settings.micMuted) VideoAudioMode.MUTED else settings.videoAudioMode
+            val recordAudio = hasAudioPermission && !isSlowMo && audioMode != VideoAudioMode.MUTED
             if (recordAudio) {
-                recorder.setAudioSource(MediaRecorder.AudioSource.MIC)
+                // WIND_CUT uses VOICE_RECOGNITION (DSP wind & background noise suppression);
+                // STEREO uses CAMCORDER (or MIC fallback) for rich stereo capture without grabbing music focus!
+                val source = when (audioMode) {
+                    VideoAudioMode.WIND_CUT -> MediaRecorder.AudioSource.VOICE_RECOGNITION
+                    else -> MediaRecorder.AudioSource.CAMCORDER
+                }
+                try {
+                    recorder.setAudioSource(source)
+                } catch (_: Exception) {
+                    recorder.setAudioSource(MediaRecorder.AudioSource.MIC)
+                }
             }
             recorder.setVideoSource(MediaRecorder.VideoSource.SURFACE)
             recorder.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
@@ -522,8 +546,15 @@ class TrueLensCameraEngine(
             recorder.setVideoEncoder(MediaRecorder.VideoEncoder.H264)
             if (recordAudio) {
                 recorder.setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
-                recorder.setAudioEncodingBitRate(128_000)
-                recorder.setAudioSamplingRate(44_100)
+                if (audioMode == VideoAudioMode.STEREO) {
+                    recorder.setAudioChannels(2)
+                    recorder.setAudioEncodingBitRate(192_000)
+                    recorder.setAudioSamplingRate(48_000)
+                } else {
+                    recorder.setAudioChannels(1)
+                    recorder.setAudioEncodingBitRate(128_000)
+                    recorder.setAudioSamplingRate(48_000)
+                }
             }
             val bitrate = if (isSlowMo) 24_000_000 else settings.videoQuality.bitRate
             recorder.setVideoEncodingBitRate(bitrate)
@@ -544,10 +575,12 @@ class TrueLensCameraEngine(
             captureSession?.close()
             captureSession = null
 
-            val outputs = listOf(OutputConfiguration(preview), OutputConfiguration(recSurface))
+            // Include jpegReader surface so user can snap crisp still photos mid-video (Feature #3)!
+            val videoOutputs = mutableListOf(OutputConfiguration(preview), OutputConfiguration(recSurface))
+            jpegReader?.surface?.takeIf { it.isValid }?.let { videoOutputs.add(OutputConfiguration(it)) }
             val sessionConfig = SessionConfiguration(
                 SessionConfiguration.SESSION_REGULAR,
-                outputs,
+                videoOutputs,
                 context.mainExecutor,
                 object : CameraCaptureSession.StateCallback() {
                     override fun onConfigured(session: CameraCaptureSession) {
@@ -557,7 +590,10 @@ class TrueLensCameraEngine(
                             req.addTarget(preview)
                             req.addTarget(recSurface)
                             applyRequestParameters(req, settings)
-                            // Cinema 180° Shutter Angle Rule: lock shutter to 1/(2 * fps) for natural cinema motion blur
+                            if (chosenFpsRange != null) {
+                                req.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, chosenFpsRange)
+                            }
+                            // Cinema 180° Shutter Angle Rule: lock shutter to 1/(2 * fps) (e.g. 1/48s at 24fps!)
                             if (!isSlowMo && settings.cinema180Shutter && lens.supportsManualSensor) {
                                 val cinemaShutterNs = (1_000_000_000L / (2L * captureFps.coerceAtLeast(24)))
                                     .coerceIn(lens.exposureTimeRangeNs.lower, lens.exposureTimeRangeNs.upper)
@@ -611,6 +647,82 @@ class TrueLensCameraEngine(
             cleanupRecorder()
             createCaptureSession()
             onFailed("Video error: ${e.message}")
+        }
+    }
+
+    fun pauseVideoRecording(): Boolean {
+        if (!isRecordingVideo) return false
+        return try {
+            mediaRecorder?.pause()
+            true
+        } catch (e: Exception) {
+            Log.w(TAG, "Pause video failed", e)
+            false
+        }
+    }
+
+    fun resumeVideoRecording(): Boolean {
+        if (!isRecordingVideo) return false
+        return try {
+            mediaRecorder?.resume()
+            true
+        } catch (e: Exception) {
+            Log.w(TAG, "Resume video failed", e)
+            false
+        }
+    }
+
+    /** Returns live 0..32767 mic amplitude from active MediaRecorder for dB level bars while filming. */
+    fun getRecordingMaxAmplitude(): Int {
+        if (!isRecordingVideo) return 0
+        return try {
+            mediaRecorder?.maxAmplitude ?: 0
+        } catch (_: Exception) {
+            0
+        }
+    }
+
+    /** Captures a still JPEG snapshot without interrupting an active video recording! */
+    fun captureVideoSnapshot(grade: LightroomGrade, settings: ManualSettings, lut: CubeLut? = null) {
+        if (!isRecordingVideo) return
+        val device = cameraDevice ?: return
+        val session = captureSession ?: return
+        val reader = jpegReader ?: return
+        val lens = activeLens ?: return
+
+        pendingRawImage?.close()
+        pendingRawImage = null
+        pendingJpegBytes = null
+        pendingCaptureResult = null
+        pendingCaptureExpectsRaw = false
+        pendingCaptureExpectsJpeg = true
+        pendingCaptureGrade = grade
+        pendingCaptureLut = lut
+        pendingCaptureSettings = settings
+
+        try {
+            val builder = device.createCaptureRequest(CameraDevice.TEMPLATE_VIDEO_SNAPSHOT)
+            builder.addTarget(reader.surface)
+            applyRequestParameters(builder, settings)
+            builder.set(CaptureRequest.JPEG_QUALITY, 95.toByte())
+            builder.set(CaptureRequest.JPEG_ORIENTATION, lens.sensorOrientation)
+            session.capture(
+                builder.build(),
+                object : CameraCaptureSession.CaptureCallback() {
+                    override fun onCaptureCompleted(
+                        session: CameraCaptureSession,
+                        request: CaptureRequest,
+                        result: TotalCaptureResult
+                    ) {
+                        pendingCaptureResult = result
+                        tryFinalizeCapture()
+                    }
+                },
+                backgroundHandler
+            )
+        } catch (e: Exception) {
+            Log.w(TAG, "Mid-video snapshot failed", e)
+            onError("Video snapshot unavailable on this lens")
         }
     }
 
@@ -800,25 +912,38 @@ class TrueLensCameraEngine(
         // Always keep CONTROL_MODE_AUTO so individual AE/AF/AWB settings are honored by the HAL
         builder.set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO)
 
-        // --- ZERO-AI OEM BYPASS PIPELINE (strictly guarded by hardware-supported modes) ---
+        // --- ZERO-AI PURE OPTICS (DEFAULT) vs OPTIONAL CLEAN ENHANCE ---
+        val useCleanEnhance = settings.enhanceMode == EnhanceMode.CLEAN
         if (settings.zeroAiBypass) {
             builder.set(CaptureRequest.CONTROL_SCENE_MODE, CaptureRequest.CONTROL_SCENE_MODE_DISABLED)
             builder.set(CaptureRequest.CONTROL_EFFECT_MODE, CaptureRequest.CONTROL_EFFECT_MODE_OFF)
-            // Disable face detection to prevent OEM beauty/skin-smoothing triggers
+            // Always disable OEM beauty/skin-smoothing face triggers
             builder.set(
                 CaptureRequest.STATISTICS_FACE_DETECT_MODE,
                 CaptureRequest.STATISTICS_FACE_DETECT_MODE_OFF
             )
-            // Disable artificial edge sharpening & aggressive noise smearing only if HAL supports it
-            if (supportedEdgeModes.contains(CaptureRequest.EDGE_MODE_OFF)) {
-                builder.set(CaptureRequest.EDGE_MODE, CaptureRequest.EDGE_MODE_OFF)
-            } else if (supportedEdgeModes.contains(CaptureRequest.EDGE_MODE_FAST)) {
-                builder.set(CaptureRequest.EDGE_MODE, CaptureRequest.EDGE_MODE_FAST)
-            }
-            if (supportedNrModes.contains(CaptureRequest.NOISE_REDUCTION_MODE_MINIMAL)) {
-                builder.set(CaptureRequest.NOISE_REDUCTION_MODE, CaptureRequest.NOISE_REDUCTION_MODE_MINIMAL)
-            } else if (supportedNrModes.contains(CaptureRequest.NOISE_REDUCTION_MODE_OFF)) {
-                builder.set(CaptureRequest.NOISE_REDUCTION_MODE, CaptureRequest.NOISE_REDUCTION_MODE_OFF)
+            if (useCleanEnhance) {
+                // Clean Enhance: tasteful hardware high-quality noise reduction + gentle crispness
+                if (supportedNrModes.contains(CaptureRequest.NOISE_REDUCTION_MODE_HIGH_QUALITY)) {
+                    builder.set(CaptureRequest.NOISE_REDUCTION_MODE, CaptureRequest.NOISE_REDUCTION_MODE_HIGH_QUALITY)
+                } else if (supportedNrModes.contains(CaptureRequest.NOISE_REDUCTION_MODE_FAST)) {
+                    builder.set(CaptureRequest.NOISE_REDUCTION_MODE, CaptureRequest.NOISE_REDUCTION_MODE_FAST)
+                }
+                if (supportedEdgeModes.contains(CaptureRequest.EDGE_MODE_FAST)) {
+                    builder.set(CaptureRequest.EDGE_MODE, CaptureRequest.EDGE_MODE_FAST)
+                }
+            } else {
+                // Default Pure Zero-AI: zero artificial sharpening & minimal noise smearing
+                if (supportedEdgeModes.contains(CaptureRequest.EDGE_MODE_OFF)) {
+                    builder.set(CaptureRequest.EDGE_MODE, CaptureRequest.EDGE_MODE_OFF)
+                } else if (supportedEdgeModes.contains(CaptureRequest.EDGE_MODE_FAST)) {
+                    builder.set(CaptureRequest.EDGE_MODE, CaptureRequest.EDGE_MODE_FAST)
+                }
+                if (supportedNrModes.contains(CaptureRequest.NOISE_REDUCTION_MODE_MINIMAL)) {
+                    builder.set(CaptureRequest.NOISE_REDUCTION_MODE, CaptureRequest.NOISE_REDUCTION_MODE_MINIMAL)
+                } else if (supportedNrModes.contains(CaptureRequest.NOISE_REDUCTION_MODE_OFF)) {
+                    builder.set(CaptureRequest.NOISE_REDUCTION_MODE, CaptureRequest.NOISE_REDUCTION_MODE_OFF)
+                }
             }
             builder.set(CaptureRequest.HOT_PIXEL_MODE, CaptureRequest.HOT_PIXEL_MODE_FAST)
         }
@@ -892,7 +1017,7 @@ class TrueLensCameraEngine(
             )
         }
 
-        // --- WHITE BALANCE (AUTO vs MANUAL KELVIN) ---
+        // --- WHITE BALANCE (AUTO vs MANUAL KELVIN vs VIDEO WB LOCK) ---
         if (settings.whiteBalanceKelvin != null && lens.supportsManualPostProcessing) {
             builder.set(CaptureRequest.CONTROL_AWB_MODE, CaptureRequest.CONTROL_AWB_MODE_OFF)
             builder.set(
@@ -905,6 +1030,7 @@ class TrueLensCameraEngine(
             )
         } else {
             builder.set(CaptureRequest.CONTROL_AWB_MODE, CaptureRequest.CONTROL_AWB_MODE_AUTO)
+            builder.set(CaptureRequest.CONTROL_AWB_LOCK, settings.videoWbLocked)
         }
 
         // --- ZOOM ---
@@ -948,10 +1074,12 @@ class TrueLensCameraEngine(
                     }
                 }
 
-                // 2. Save Clean / Graded JPEG (with EXIF orientation + optional Mirror-Save, .cube LUT & Analog Date Stamp)
+                // 2. Save Clean / Graded JPEG (with EXIF orientation, optional Clean Enhance, Mirror-Save, .cube LUT & Date Stamp)
+                val jpegDisplayName = "TrueLens_$stamp.jpg"
                 if (jpegBytes != null) {
                     val hasDateStamp = settings.dateStampStyle != com.truelens.camera.grading.DateStampStyle.OFF
-                    val needTransform = !grade.isNeutral || lut != null ||
+                    val useClean = settings.enhanceMode == EnhanceMode.CLEAN
+                    val needTransform = !grade.isNeutral || lut != null || useClean ||
                         (lens.isFront && settings.mirrorFrontSave) || hasDateStamp
                     val finalBytes = if (needTransform) {
                         val oriented = decodeJpegWithExifOrientation(
@@ -959,8 +1087,16 @@ class TrueLensCameraEngine(
                             mirrorHorizontal = lens.isFront && settings.mirrorFrontSave
                         )
                         if (oriented != null) {
-                            val graded = BitmapGrader.applyGrade(oriented, grade, lut)
-                            oriented.recycle()
+                            val enhanced = if (useClean) {
+                                BitmapGrader.applyCleanEnhance(oriented).also {
+                                    if (it !== oriented) oriented.recycle()
+                                }
+                            } else oriented
+                            val graded = if (!grade.isNeutral || lut != null) {
+                                BitmapGrader.applyGrade(enhanced, grade, lut).also {
+                                    if (it !== enhanced) enhanced.recycle()
+                                }
+                            } else enhanced
                             val stamped = if (hasDateStamp) {
                                 com.truelens.camera.grading.PhotoFrameRenderer.applyDateStamp(
                                     graded, settings.dateStampStyle, timestamp
@@ -978,14 +1114,15 @@ class TrueLensCameraEngine(
                     } else {
                         jpegBytes
                     }
-                    savedJpegUri = saveJpegToMediaStore(finalBytes, "TrueLens_$stamp.jpg")
+                    savedJpegUri = saveJpegToMediaStore(finalBytes, jpegDisplayName)
                 }
 
                 val iso = result.get(CaptureResult.SENSOR_SENSITIVITY) ?: 100
                 val exp = result.get(CaptureResult.SENSOR_EXPOSURE_TIME) ?: 16_666_666L
                 val formatBadge = when {
-                    savedDngUri != null && savedJpegUri != null -> "RAW+JPG"
+                    savedDngUri != null && savedJpegUri != null -> if (settings.enhanceMode == EnhanceMode.CLEAN) "RAW+CLEAN" else "RAW+JPG"
                     savedDngUri != null -> "DNG RAW"
+                    settings.enhanceMode == EnhanceMode.CLEAN -> "CLEAN+"
                     else -> "CLEAN JPG"
                 }
 
@@ -993,7 +1130,7 @@ class TrueLensCameraEngine(
                     CapturedPhoto(
                         jpegUri = savedJpegUri,
                         dngUri = savedDngUri,
-                        filePath = null,
+                        filePath = if (savedJpegUri != null) jpegDisplayName else null,
                         timestampMs = timestamp,
                         iso = iso,
                         shutterSpeedNs = exp,

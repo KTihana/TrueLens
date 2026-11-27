@@ -23,7 +23,9 @@ class LiveGradingRenderer(
     private val onSurfaceReady: (Surface) -> Unit,
     private val requestRenderCallback: () -> Unit,
     private val onHistogramSampled: ((FloatArray) -> Unit)? = null,
-    private val onPalmSampled: ((Bitmap) -> Unit)? = null
+    private val onPalmSampled: ((Bitmap) -> Unit)? = null,
+    private val onScannerSampled: ((Bitmap) -> Unit)? = null,
+    private val onLivePhotoSampled: ((Bitmap) -> Unit)? = null
 ) : GLSurfaceView.Renderer {
 
     @Volatile var grade: LightroomGrade = LightroomGrade.NEUTRAL
@@ -38,6 +40,14 @@ class LiveGradingRenderer(
     @Volatile var splitScreenPos: Float = -1f // -1 = off, 0..1 = live vertical Before/After divider
     @Volatile var histogramSamplingEnabled: Boolean = true
     @Volatile var palmSamplingEnabled: Boolean = false
+    @Volatile var scannerSamplingEnabled: Boolean = false
+    @Volatile var livePhotoSamplingEnabled: Boolean = false
+    // Portrait / Cinematic shallow depth-of-field rack-focus parameters
+    @Volatile var bokehStrength: Float = 0f // 0..1 (0 = off)
+    @Volatile var bokehTargetX: Float = 0.5f
+    @Volatile var bokehTargetY: Float = 0.45f
+    private var curBokehX: Float = 0.5f
+    private var curBokehY: Float = 0.45f
 
     @Volatile private var bufferWidth: Int = 1440
     @Volatile private var bufferHeight: Int = 1080
@@ -45,6 +55,8 @@ class LiveGradingRenderer(
     @Volatile private var pendingBufferResize: Boolean = false
     private var lastHistogramSampleMs: Long = 0L
     private var lastPalmSampleMs: Long = 0L
+    private var lastScannerSampleMs: Long = 0L
+    private var lastLivePhotoSampleMs: Long = 0L
     private var histReadBuf: ByteBuffer? = null
     private var palmReadBuf: ByteBuffer? = null
 
@@ -92,6 +104,8 @@ class LiveGradingRenderer(
     private var uHslVecLoc = -1
     private var uHslBlueLumLoc = -1
     private var uCurveVecLoc = -1
+    private var uBokehParamsLoc = -1
+    private var uAnalogFxLoc = -1
 
     private var viewportW = 1080
     private var viewportH = 1920
@@ -131,6 +145,8 @@ class LiveGradingRenderer(
         uHslVecLoc = GLES20.glGetUniformLocation(programId, "uHslVec")
         uHslBlueLumLoc = GLES20.glGetUniformLocation(programId, "uHslBlueLum")
         uCurveVecLoc = GLES20.glGetUniformLocation(programId, "uCurveVec")
+        uBokehParamsLoc = GLES20.glGetUniformLocation(programId, "uBokehParams")
+        uAnalogFxLoc = GLES20.glGetUniformLocation(programId, "uAnalogFx")
 
         val textures = IntArray(1)
         GLES20.glGenTextures(1, textures, 0)
@@ -253,6 +269,11 @@ class LiveGradingRenderer(
         GLES20.glUniform4f(uHslVecLoc, g.hslRedSat, g.hslSkinLum, g.hslGreenSat, g.hslBlueSat)
         GLES20.glUniform1f(uHslBlueLumLoc, g.hslBlueLum)
         GLES20.glUniform3f(uCurveVecLoc, g.curveShadows, g.curveMidtones, g.curveHighlights)
+        // Smooth cinema rack-focus interpolation toward tapped focus point
+        curBokehX += (bokehTargetX - curBokehX) * 0.14f
+        curBokehY += (bokehTargetY - curBokehY) * 0.14f
+        GLES20.glUniform4f(uBokehParamsLoc, bokehStrength, curBokehX, 1.0f - curBokehY, if (bokehStrength > 0.01f) 1f else 0f)
+        GLES20.glUniform4f(uAnalogFxLoc, g.halation, g.lightLeakStyle.toFloat(), g.lightLeakIntensity, g.vhsRetro)
 
         val posLoc = GLES20.glGetAttribLocation(programId, "aPosition")
         val texLoc = GLES20.glGetAttribLocation(programId, "aTexCoord")
@@ -282,12 +303,27 @@ class LiveGradingRenderer(
         val palmCb = onPalmSampled
         if (palmSamplingEnabled && palmCb != null && now - lastPalmSampleMs >= 320L) {
             lastPalmSampleMs = now
-            samplePalmBitmap(quadScale, palmCb)
+            sampleDownscaledBitmap(quadScale, targetLongEdge = 280, callback = palmCb)
+        }
+
+        // Lightweight QR + Live Text viewfinder frame sampling (~2.2fps) ONLY when enabled
+        val scanCb = onScannerSampled
+        if (scannerSamplingEnabled && scanCb != null && now - lastScannerSampleMs >= 450L) {
+            lastScannerSampleMs = now
+            sampleDownscaledBitmap(quadScale, targetLongEdge = 480, callback = scanCb)
+        }
+
+        // Lightweight Motion / Live Photo rolling ring-buffer sampling (~10fps) ONLY when Live Photos is ON
+        val liveCb = onLivePhotoSampled
+        if (livePhotoSamplingEnabled && liveCb != null && now - lastLivePhotoSampleMs >= 100L) {
+            lastLivePhotoSampleMs = now
+            sampleDownscaledBitmap(quadScale, targetLongEdge = 480, callback = liveCb)
         }
     }
 
-    private fun samplePalmBitmap(
+    private fun sampleDownscaledBitmap(
         quadScale: AspectRatioMath.QuadScale,
+        targetLongEdge: Int,
         callback: (Bitmap) -> Unit
     ) {
         val drawW = (viewportW * quadScale.scaleX).toInt().coerceAtLeast(1)
@@ -298,8 +334,7 @@ class LiveGradingRenderer(
         val readH = drawH.coerceAtMost(viewportH - startY)
         if (readW < 64 || readH < 64) return
 
-        // Downsample 4x on readback into a crisp ~270x360 upright bitmap for ML Kit Pose Detection
-        val step = (maxOf(readW, readH) / 280).coerceAtLeast(1)
+        val step = (maxOf(readW, readH) / targetLongEdge.coerceAtLeast(120)).coerceAtLeast(1)
         val outW = (readW / step).coerceAtLeast(1)
         val outH = (readH / step).coerceAtLeast(1)
 
@@ -456,6 +491,8 @@ class LiveGradingRenderer(
             uniform vec4 uHslVec;        // x=redSat, y=skinLum, z=greenSat, w=blueSat
             uniform float uHslBlueLum;
             uniform vec3 uCurveVec;      // x=shadows, y=midtones, z=highlights
+            uniform vec4 uBokehParams;   // x=strength(0..1), y=focusX, z=focusY, w=enabled
+            uniform vec4 uAnalogFx;      // x=halation, y=lightLeakStyle(0..5), z=lightLeakIntensity, w=vhsRetro
 
             float rand(vec2 co) {
                 return fract(sin(dot(co.xy, vec2(12.9898, 78.233))) * 43758.5453);
@@ -480,6 +517,26 @@ class LiveGradingRenderer(
                 }
 
                 vec3 col = texture2D(sTexture, uv).rgb;
+
+                // Real-time GPU Portrait / Cinematic Shallow Depth-of-Field + Smooth Rack Focus
+                if (uBokehParams.w > 0.5 && uBokehParams.x > 0.01) {
+                    vec2 focusDelta = vRawUv - uBokehParams.yz;
+                    float focusDist = length(vec2(focusDelta.x * 1.15, focusDelta.y * 0.95));
+                    float coc = smoothstep(0.18, 0.54, focusDist) * uBokehParams.x;
+                    if (coc > 0.02) {
+                        vec2 r = uTexelSize * (10.0 * coc);
+                        vec3 acc = col * 0.14;
+                        acc += texture2D(sTexture, clamp(uv + vec2( r.x,  0.0), 0.0, 1.0)).rgb * 0.11;
+                        acc += texture2D(sTexture, clamp(uv + vec2(-r.x,  0.0), 0.0, 1.0)).rgb * 0.11;
+                        acc += texture2D(sTexture, clamp(uv + vec2( 0.0,  r.y), 0.0, 1.0)).rgb * 0.11;
+                        acc += texture2D(sTexture, clamp(uv + vec2( 0.0, -r.y), 0.0, 1.0)).rgb * 0.11;
+                        acc += texture2D(sTexture, clamp(uv + vec2( r.x * 0.72,  r.y * 0.72), 0.0, 1.0)).rgb * 0.105;
+                        acc += texture2D(sTexture, clamp(uv + vec2(-r.x * 0.72,  r.y * 0.72), 0.0, 1.0)).rgb * 0.105;
+                        acc += texture2D(sTexture, clamp(uv + vec2( r.x * 0.72, -r.y * 0.72), 0.0, 1.0)).rgb * 0.105;
+                        acc += texture2D(sTexture, clamp(uv + vec2(-r.x * 0.72, -r.y * 0.72), 0.0, 1.0)).rgb * 0.105;
+                        col = mix(col, acc, clamp(coc, 0.0, 1.0));
+                    }
+                }
                 bool isLeftRawSide = (uSplitPos >= 0.0 && vRawUv.x < uSplitPos);
 
                 if (uBypass < 0.5 && !isLeftRawSide) {
@@ -548,6 +605,68 @@ class LiveGradingRenderer(
                     if (uGrain > 0.001) {
                         float n = (rand(vRawUv * 120.0 + vec2(uTime, uTime * 1.37)) - 0.5) * uGrain * 0.14;
                         col += vec3(n);
+                    }
+
+                    // 9. Optional Film Halation Highlight Bloom (CineStill 800T warm red-orange halo around bright highlights)
+                    if (uAnalogFx.x > 0.01) {
+                        vec2 hr = uTexelSize * 7.5;
+                        vec3 h1 = texture2D(sTexture, clamp(uv + vec2( hr.x,  0.0), 0.0, 1.0)).rgb;
+                        vec3 h2 = texture2D(sTexture, clamp(uv + vec2(-hr.x,  0.0), 0.0, 1.0)).rgb;
+                        vec3 h3 = texture2D(sTexture, clamp(uv + vec2( 0.0,  hr.y), 0.0, 1.0)).rgb;
+                        vec3 h4 = texture2D(sTexture, clamp(uv + vec2( 0.0, -hr.y), 0.0, 1.0)).rgb;
+                        float brightAvg = (lumaOf(h1) + lumaOf(h2) + lumaOf(h3) + lumaOf(h4)) * 0.25;
+                        float halo = smoothstep(0.68, 1.0, brightAvg) * uAnalogFx.x;
+                        col += vec3(1.0, 0.30, 0.08) * halo * 0.42;
+                    }
+
+                    // 10. Optional Analog Film Light Leaks (5 distinct styles so every look feels unique!)
+                    if (uAnalogFx.y > 0.5 && uAnalogFx.z > 0.01) {
+                        float s = uAnalogFx.y;
+                        float amt = uAnalogFx.z;
+                        vec3 leak = vec3(0.0);
+                        if (s < 1.5) {
+                            // Style 1: Warm Left Edge Film Burn
+                            float w1 = exp(-pow((vRawUv.x - 0.04) * 3.8, 2.0)) * (0.65 + 0.35 * sin(vRawUv.y * 3.14159));
+                            leak = vec3(1.0, 0.36, 0.08) * w1 * 0.72;
+                        } else if (s < 2.5) {
+                            // Style 2: Amber Corner '89 Flare
+                            float d2 = length((vRawUv - vec2(0.92, 0.88)) * vec2(1.3, 1.1));
+                            float w2 = exp(-d2 * d2 * 5.2);
+                            leak = vec3(1.0, 0.54, 0.12) * w2 * 0.78;
+                        } else if (s < 3.5) {
+                            // Style 3: Rose Prism Diagonal Glow
+                            float diag = abs((vRawUv.x * 0.85 + vRawUv.y * 0.55) - 0.36);
+                            float w3 = exp(-diag * diag * 16.0);
+                            leak = vec3(0.98, 0.34, 0.52) * w3 * 0.58;
+                        } else if (s < 4.5) {
+                            // Style 4: Golden Right Sun Streak
+                            float w4 = exp(-pow((vRawUv.x - 0.94) * 4.2, 2.0)) * exp(-pow((vRawUv.y - 0.48) * 1.6, 2.0));
+                            leak = vec3(1.0, 0.72, 0.22) * w4 * 0.75;
+                        } else {
+                            // Style 5: Sunset Dual-Edge Burn
+                            float wl = exp(-pow(vRawUv.x * 4.2, 2.0));
+                            float wr = exp(-pow((1.0 - vRawUv.x) * 4.2, 2.0));
+                            leak = vec3(1.0, 0.30, 0.08) * wl * 0.62 + vec3(1.0, 0.62, 0.16) * wr * 0.52;
+                        }
+                        // Optical Screen blend so dark areas lift warmly without muddying highlights
+                        vec3 leakScaled = clamp(leak * amt, 0.0, 0.95);
+                        col = 1.0 - (1.0 - clamp(col, 0.0, 1.0)) * (1.0 - leakScaled);
+                    }
+
+                    // 11. Optional 90s VHS / Camcorder Retro Tape Look (Chroma Bleed + Scanlines + Tracking Jitter)
+                    if (uAnalogFx.w > 0.01) {
+                        float vhs = uAnalogFx.w;
+                        float shift = uTexelSize.x * (5.5 * vhs);
+                        float rBleed = texture2D(sTexture, clamp(uv + vec2(shift, 0.0), 0.0, 1.0)).r;
+                        float bBleed = texture2D(sTexture, clamp(uv - vec2(shift, 0.0), 0.0, 1.0)).b;
+                        col.r = mix(col.r, rBleed, 0.48 * vhs);
+                        col.b = mix(col.b, bBleed, 0.48 * vhs);
+                        float scan = 0.5 + 0.5 * sin(vRawUv.y * 540.0 + uTime * 4.0);
+                        col *= (1.0 - 0.11 * vhs * scan);
+                        // Subtle analog tape tracking bar near bottom
+                        float barY = fract(uTime * 0.09);
+                        float trackBar = smoothstep(0.025, 0.0, abs(vRawUv.y - barY));
+                        col += vec3(0.08, 0.07, 0.06) * trackBar * vhs;
                     }
                 }
 

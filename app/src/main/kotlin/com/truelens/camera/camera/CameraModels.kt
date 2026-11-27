@@ -21,7 +21,12 @@ enum class CaptureFormat(val badge: String, val description: String) {
 enum class ShootingMode(val label: String) {
     PHOTO("PHOTO"),
     VIDEO("VIDEO"),
+    PORTRAIT("PORTRAIT"),
     DUAL("DUAL"),
+    CINEMATIC("CINEMATIC"),
+    ASTRO("ASTRO"),
+    DOUBLE_EXP("DOUBLE EXP"),
+    ACTION_PAN("ACTION PAN"),
     SLOW_MO("SLOW-MO"),
     STOP_MO("STOP MOTION"),
     LONG_EXP("LONG EXPOSURE"),
@@ -29,6 +34,43 @@ enum class ShootingMode(val label: String) {
     PANORAMA("PANORAMA"),
     TIMELAPSE("TIME-LAPSE"),
     SCAN_DOC("SCAN DOC")
+}
+
+enum class AstroStyle(val label: String) {
+    PINPOINT_STARS("Pinpoint Stars"),
+    STAR_TRAILS("Star Trails")
+}
+
+enum class SkyPreset(val label: String) {
+    MILKY_WAY("Milky Way"),
+    STAR_TRAILS("Star Trails"),
+    FULL_MOON("Full Moon"),
+    SUNSET_SKY("Sunset Sky")
+}
+
+enum class DoubleExpBlendMode(val label: String) {
+    SCREEN("Screen"),
+    OVERLAY("Overlay"),
+    LIGHTEN("Lighten"),
+    AVERAGE("Blend")
+}
+
+enum class EnhanceMode(val label: String) {
+    OFF("Off"),
+    CLEAN("Clean")
+}
+
+enum class VideoAudioMode(val label: String) {
+    STEREO("Stereo"),
+    WIND_CUT("Wind Cut"),
+    MUTED("Muted")
+}
+
+enum class NightModeDuration(val seconds: Int, val label: String) {
+    OFF(0, "Off"),
+    ONE_S(1, "1s"),
+    TWO_S(2, "2s"),
+    THREE_S(3, "3s")
 }
 
 enum class HandsFreeMode(val label: String) {
@@ -91,8 +133,10 @@ enum class FlashMode(val label: String) {
 }
 
 enum class VideoQuality(val label: String, val targetWidth: Int, val targetHeight: Int, val targetFps: Int, val bitRate: Int) {
+    FHD_24("1080p 24", 1920, 1080, 24, 14_000_000),
     FHD_30("1080p 30", 1920, 1080, 30, 16_000_000),
     FHD_60("1080p 60", 1920, 1080, 60, 24_000_000),
+    UHD_24("4K 24", 3840, 2160, 24, 38_000_000),
     UHD_30("4K 30", 3840, 2160, 30, 42_000_000)
 }
 
@@ -149,10 +193,32 @@ data class ManualSettings(
     val flashMode: FlashMode = FlashMode.OFF,
     val videoQuality: VideoQuality = VideoQuality.FHD_30,
     val micMuted: Boolean = false,
+    val videoAudioMode: VideoAudioMode = VideoAudioMode.STEREO,
+    val videoWbLocked: Boolean = false,
+    val keepMusicPlaying: Boolean = true,
     val cinema180Shutter: Boolean = false,
+    val enhanceMode: EnhanceMode = EnhanceMode.OFF,
+    val qrScannerEnabled: Boolean = true,
+    val liveTextEnabled: Boolean = true,
+    val livePhotoEnabled: Boolean = false,
+    val nightModeDuration: NightModeDuration = NightModeDuration.OFF,
+    val portraitApertureF: Float = 2.0f,
     val dateStampStyle: com.truelens.camera.grading.DateStampStyle = com.truelens.camera.grading.DateStampStyle.OFF,
     val handsFreeMode: HandsFreeMode = HandsFreeMode.OFF,
-    val dualLayout: com.truelens.camera.grading.DualCameraLayout = com.truelens.camera.grading.DualCameraLayout.SPLIT
+    val dualLayout: com.truelens.camera.grading.DualCameraLayout = com.truelens.camera.grading.DualCameraLayout.SPLIT,
+    // New v2.2 settings (all toggleable & persisted!)
+    val shutterSoundEnabled: Boolean = true,
+    val audioMeterEnabled: Boolean = false,
+    val autoNightPromptEnabled: Boolean = true,
+    val floatingShutterEnabled: Boolean = false,
+    val astroRedUiEnabled: Boolean = false,
+    val astroDurationSec: Int = 30,
+    val astroStyle: AstroStyle = AstroStyle.PINPOINT_STARS,
+    val astroLightPollutionClean: Boolean = true,
+    val astroHotPixelClean: Boolean = true,
+    val astroStarLoupeEnabled: Boolean = false,
+    val doubleExpBlend: DoubleExpBlendMode = DoubleExpBlendMode.SCREEN,
+    val actionPanStrength: Float = 0.65f
 )
 
 data class LiveTelemetry(

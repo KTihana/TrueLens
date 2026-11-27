@@ -312,7 +312,10 @@ enum class GradeTool(
     CURVE_MID("Curve Mid", Icons.Default.Contrast, -1f..1f),
     CURVE_HIGH("Curve Light", Icons.Default.WbSunny, -1f..1f),
     VIGNETTE("Vignette", Icons.Default.Vignette, 0f..1f),
-    GRAIN("Grain", Icons.Default.Grain, 0f..1f)
+    GRAIN("Grain", Icons.Default.Grain, 0f..1f),
+    HALATION("Halation", Icons.Default.WbSunny, 0f..1f),
+    LIGHT_LEAK("Light Leak", Icons.Default.AutoAwesome, 0f..1f),
+    VHS_RETRO("VHS '94", Icons.Default.BlurOn, 0f..1f)
 }
 
 /**
@@ -420,6 +423,42 @@ fun LightroomLiveDeck(
         }
 
         if (!showModeTabs || modeTab == 0) {
+            // Multiple Light Leak Style Selector Row (5 unique analog leak styles when Light Leak is active!)
+            if (selectedTool == GradeTool.LIGHT_LEAK) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .horizontalScroll(rememberScrollState())
+                        .padding(bottom = 6.dp),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    LightroomGrade.LIGHT_LEAK_LABELS.forEachIndexed { styleIdx, styleName ->
+                        val sel = grade.lightLeakStyle == styleIdx
+                        Box(
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(10.dp))
+                                .background(if (sel) Color(0xFFFF6B35) else Color(0x1EFFFFFF))
+                                .clickable {
+                                    onUpdateGrade { g ->
+                                        g.copy(
+                                            lightLeakStyle = styleIdx,
+                                            lightLeakIntensity = if (styleIdx == 0) 0f else g.lightLeakIntensity.coerceAtLeast(0.55f)
+                                        )
+                                    }
+                                }
+                                .padding(horizontal = 9.dp, vertical = 4.dp)
+                        ) {
+                            Text(
+                                text = styleName,
+                                color = Color.White,
+                                fontSize = 10.sp,
+                                fontWeight = if (sel) FontWeight.Bold else FontWeight.Medium
+                            )
+                        }
+                    }
+                }
+            }
+
             // Single Precision Tick-Ruler for active adjustment tool
             val curVal = getGradeValue(grade, selectedTool)
             val labelText = if (selectedTool.isEv) {
@@ -588,6 +627,9 @@ private fun getGradeValue(g: LightroomGrade, t: GradeTool): Float = when (t) {
     GradeTool.CURVE_HIGH -> g.curveHighlights
     GradeTool.VIGNETTE -> g.vignette
     GradeTool.GRAIN -> g.grain
+    GradeTool.HALATION -> g.halation
+    GradeTool.LIGHT_LEAK -> g.lightLeakIntensity
+    GradeTool.VHS_RETRO -> g.vhsRetro
 }
 
 private fun setGradeValue(g: LightroomGrade, t: GradeTool, v: Float): LightroomGrade = when (t) {
@@ -612,6 +654,12 @@ private fun setGradeValue(g: LightroomGrade, t: GradeTool, v: Float): LightroomG
     GradeTool.CURVE_HIGH -> g.copy(curveHighlights = v)
     GradeTool.VIGNETTE -> g.copy(vignette = v)
     GradeTool.GRAIN -> g.copy(grain = v)
+    GradeTool.HALATION -> g.copy(halation = v)
+    GradeTool.LIGHT_LEAK -> g.copy(
+        lightLeakStyle = if (v > 0.01f && g.lightLeakStyle == 0) 1 else if (v <= 0.01f) 0 else g.lightLeakStyle,
+        lightLeakIntensity = v
+    )
+    GradeTool.VHS_RETRO -> g.copy(vhsRetro = v)
 }
 
 fun formatShutterNs(ns: Long): String {

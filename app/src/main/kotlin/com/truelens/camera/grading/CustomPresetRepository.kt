@@ -39,7 +39,19 @@ class CustomPresetRepository(context: Context) {
                         saturation = o.optDouble("saturation", 0.0).toFloat(),
                         clarity = o.optDouble("clarity", 0.0).toFloat(),
                         vignette = o.optDouble("vignette", 0.0).toFloat(),
-                        grain = o.optDouble("grain", 0.0).toFloat()
+                        grain = o.optDouble("grain", 0.0).toFloat(),
+                        hslRedSat = o.optDouble("hslRedSat", 0.0).toFloat(),
+                        hslSkinLum = o.optDouble("hslSkinLum", 0.0).toFloat(),
+                        hslGreenSat = o.optDouble("hslGreenSat", 0.0).toFloat(),
+                        hslBlueSat = o.optDouble("hslBlueSat", 0.0).toFloat(),
+                        hslBlueLum = o.optDouble("hslBlueLum", 0.0).toFloat(),
+                        curveShadows = o.optDouble("curveShadows", 0.0).toFloat(),
+                        curveMidtones = o.optDouble("curveMidtones", 0.0).toFloat(),
+                        curveHighlights = o.optDouble("curveHighlights", 0.0).toFloat(),
+                        halation = o.optDouble("halation", 0.0).toFloat(),
+                        lightLeakStyle = o.optInt("lightLeakStyle", 0),
+                        lightLeakIntensity = o.optDouble("lightLeakIntensity", 0.0).toFloat(),
+                        vhsRetro = o.optDouble("vhsRetro", 0.0).toFloat()
                     ),
                     isCustom = true
                 )
@@ -93,6 +105,18 @@ class CustomPresetRepository(context: Context) {
                     put("clarity", g.clarity.toDouble())
                     put("vignette", g.vignette.toDouble())
                     put("grain", g.grain.toDouble())
+                    put("hslRedSat", g.hslRedSat.toDouble())
+                    put("hslSkinLum", g.hslSkinLum.toDouble())
+                    put("hslGreenSat", g.hslGreenSat.toDouble())
+                    put("hslBlueSat", g.hslBlueSat.toDouble())
+                    put("hslBlueLum", g.hslBlueLum.toDouble())
+                    put("curveShadows", g.curveShadows.toDouble())
+                    put("curveMidtones", g.curveMidtones.toDouble())
+                    put("curveHighlights", g.curveHighlights.toDouble())
+                    put("halation", g.halation.toDouble())
+                    put("lightLeakStyle", g.lightLeakStyle)
+                    put("lightLeakIntensity", g.lightLeakIntensity.toDouble())
+                    put("vhsRetro", g.vhsRetro.toDouble())
                 }
             )
         }

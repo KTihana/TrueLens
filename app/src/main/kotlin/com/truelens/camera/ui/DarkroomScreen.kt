@@ -35,7 +35,14 @@ import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.Compare
 import androidx.compose.material.icons.filled.CropFree
 import androidx.compose.material.icons.filled.CropRotate
+import android.widget.VideoView
 import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.Favorite
+import androidx.compose.material.icons.filled.FavoriteBorder
+import androidx.compose.material.icons.filled.Info
+import androidx.compose.material.icons.filled.MotionPhotosOn
+import androidx.compose.material.icons.filled.Movie
+import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.material.icons.filled.Share
 import androidx.compose.material.icons.filled.Tune
 import androidx.compose.material3.AlertDialog
@@ -98,15 +105,34 @@ fun DarkroomScreen(
     onUndo: () -> Unit,
     onRedo: () -> Unit,
     onDeletePhoto: () -> Unit,
+    onSaveKeyPhoto: (Bitmap) -> Unit = {},
+    onExportLiveVideo: () -> Unit = {},
     onExport: () -> Unit
 ) {
     BackHandler(onBack = onClose)
     val context = LocalContext.current
     var showOriginal by remember { mutableStateOf(false) }
     var showDeleteConfirm by remember { mutableStateOf(false) }
+    var showExifDialog by remember { mutableStateOf(false) }
+    var favoriteSet by remember(state.darkroomSourceUri) { mutableStateOf(GalleryFavoritesStore.load(context)) }
     var activeTab by remember { mutableStateOf(DarkroomTab.PRESETS) }
     var selectedPresetId by remember(state.darkroomSourceUri) { mutableStateOf("true_zero") }
     var straightenAxis by remember { mutableStateOf(0) } // 0 = Rotate, 1 = Vertical Tilt, 2 = Horizontal Tilt
+    var isPlayingLiveMotion by remember(state.darkroomSourceUri) { mutableStateOf(false) }
+    var showKeyPhotoPicker by remember(state.darkroomSourceUri) { mutableStateOf(false) }
+    var selectedKeyFrameIdx by remember(state.darkroomSourceUri) { mutableStateOf(0) }
+    val liveKeyFrames by produceState<List<Pair<Long, Bitmap>>>(
+        initialValue = emptyList(),
+        state.darkroomLiveVideoFile,
+        showKeyPhotoPicker
+    ) {
+        val f = state.darkroomLiveVideoFile
+        value = if (showKeyPhotoPicker && f != null) {
+            com.truelens.camera.modes.LivePhotoController.extractKeyPhotoFrames(f, maxFrames = 12)
+        } else {
+            emptyList()
+        }
+    }
 
     val displayBitmap = if (showOriginal) state.darkroomSourceBitmap else state.darkroomGradedBitmap
     val recentShots by produceState<List<GalleryPhotoItem>>(initialValue = emptyList(), state.darkroomSourceUri) {
@@ -188,14 +214,47 @@ fun DarkroomScreen(
             }
 
             Row(
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 val activeUri = state.darkroomSourceUri ?: state.lastCapturedPhoto?.jpegUri
                 if (activeUri != null) {
+                    val isFav = activeUri.toString() in favoriteSet
                     Box(
                         modifier = Modifier
-                            .size(36.dp)
+                            .size(34.dp)
+                            .clip(CircleShape)
+                            .background(if (isFav) TrueLensPalette.RecordCoral.copy(alpha = 0.25f) else Color(0x14FFFFFF))
+                            .clickable {
+                                favoriteSet = GalleryFavoritesStore.toggle(context, activeUri)
+                            },
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Icon(
+                            imageVector = if (isFav) Icons.Default.Favorite else Icons.Default.FavoriteBorder,
+                            contentDescription = "Favorite Photo",
+                            tint = if (isFav) TrueLensPalette.RecordCoral else Color.White,
+                            modifier = Modifier.size(16.dp)
+                        )
+                    }
+                    Box(
+                        modifier = Modifier
+                            .size(34.dp)
+                            .clip(CircleShape)
+                            .background(Color(0x14FFFFFF))
+                            .clickable { showExifDialog = true },
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Info,
+                            contentDescription = "Photo EXIF Info",
+                            tint = Color.White,
+                            modifier = Modifier.size(16.dp)
+                        )
+                    }
+                    Box(
+                        modifier = Modifier
+                            .size(34.dp)
                             .clip(CircleShape)
                             .background(Color(0x14FFFFFF))
                             .clickable {
@@ -212,12 +271,12 @@ fun DarkroomScreen(
                             imageVector = Icons.Default.Share,
                             contentDescription = "Share Photo",
                             tint = Color.White,
-                            modifier = Modifier.size(17.dp)
+                            modifier = Modifier.size(16.dp)
                         )
                     }
                     Box(
                         modifier = Modifier
-                            .size(36.dp)
+                            .size(34.dp)
                             .clip(CircleShape)
                             .background(Color(0x14FFFFFF))
                             .clickable { showDeleteConfirm = true },
@@ -227,7 +286,7 @@ fun DarkroomScreen(
                             imageVector = Icons.Default.Delete,
                             contentDescription = "Delete Photo",
                             tint = Color.White.copy(alpha = 0.85f),
-                            modifier = Modifier.size(17.dp)
+                            modifier = Modifier.size(16.dp)
                         )
                     }
                 }
@@ -236,7 +295,7 @@ fun DarkroomScreen(
                         .clip(RoundedCornerShape(20.dp))
                         .background(Color.White)
                         .clickable(enabled = !state.isExportingDarkroom) { onExport() }
-                        .padding(horizontal = 18.dp, vertical = 9.dp),
+                        .padding(horizontal = 15.dp, vertical = 8.dp),
                     contentAlignment = Alignment.Center
                 ) {
                     if (state.isExportingDarkroom) {
@@ -267,7 +326,35 @@ fun DarkroomScreen(
                 .background(TrueLensPalette.SurfaceDark),
             contentAlignment = Alignment.Center
         ) {
-            if (displayBitmap != null) {
+            val activeKeyFrame = if (showKeyPhotoPicker && liveKeyFrames.isNotEmpty()) {
+                liveKeyFrames[selectedKeyFrameIdx.coerceIn(0, liveKeyFrames.lastIndex)].second
+            } else null
+
+            if (isPlayingLiveMotion && state.darkroomLiveVideoFile != null) {
+                AndroidView(
+                    modifier = Modifier.fillMaxSize(),
+                    factory = { ctx ->
+                        VideoView(ctx).apply {
+                            setVideoPath(state.darkroomLiveVideoFile.absolutePath)
+                            setOnPreparedListener { mp ->
+                                mp.isLooping = true
+                                start()
+                            }
+                            setOnClickListener { isPlayingLiveMotion = false }
+                        }
+                    },
+                    onRelease = { vv ->
+                        try { vv.stopPlayback() } catch (_: Exception) {}
+                    }
+                )
+            } else if (activeKeyFrame != null) {
+                Image(
+                    bitmap = activeKeyFrame.asImageBitmap(),
+                    contentDescription = "Selected Key Frame",
+                    contentScale = ContentScale.Fit,
+                    modifier = Modifier.fillMaxSize()
+                )
+            } else if (displayBitmap != null) {
                 Image(
                     bitmap = displayBitmap.asImageBitmap(),
                     contentDescription = "Photo Preview",
@@ -276,31 +363,176 @@ fun DarkroomScreen(
                 )
             }
 
-            // Floating Before/After Compare Button at bottom-right of photo (matching Image #2!)
-            Box(
-                modifier = Modifier
-                    .align(Alignment.BottomEnd)
-                    .padding(14.dp)
-                    .size(38.dp)
-                    .clip(RoundedCornerShape(12.dp))
-                    .background(if (showOriginal) TrueLensPalette.AccentViolet else Color(0xAA141418))
-                    .pointerInput(Unit) {
-                        detectTapGestures(
-                            onPress = {
-                                showOriginal = true
-                                tryAwaitRelease()
-                                showOriginal = false
+            // LIVE PHOTO Badge + Replay + Key Photo Picker Bar (when photo has a 3s Live Motion clip!)
+            if (state.darkroomLiveVideoFile != null) {
+                Row(
+                    modifier = Modifier
+                        .align(Alignment.TopStart)
+                        .padding(12.dp),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(14.dp))
+                            .background(if (isPlayingLiveMotion) Color(0xFFFFB300) else Color(0xCC121218))
+                            .border(0.75.dp, Color(0xFFFFB300).copy(alpha = 0.8f), RoundedCornerShape(14.dp))
+                            .clickable {
+                                showKeyPhotoPicker = false
+                                isPlayingLiveMotion = !isPlayingLiveMotion
                             }
+                            .padding(horizontal = 10.dp, vertical = 5.dp)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.MotionPhotosOn,
+                            contentDescription = "Play Live Photo",
+                            tint = if (isPlayingLiveMotion) Color.Black else Color(0xFFFFB300),
+                            modifier = Modifier.size(15.dp)
                         )
-                    },
-                contentAlignment = Alignment.Center
-            ) {
-                Icon(
-                    imageVector = Icons.Default.Compare,
-                    contentDescription = "Hold to Compare Original",
-                    tint = Color.White,
-                    modifier = Modifier.size(19.dp)
-                )
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Text(
+                            text = if (isPlayingLiveMotion) "STOP LIVE" else "LIVE • PLAY",
+                            color = if (isPlayingLiveMotion) Color.Black else Color(0xFFFFB300),
+                            fontSize = 10.sp,
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
+
+                    Box(
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(14.dp))
+                            .background(if (showKeyPhotoPicker) TrueLensPalette.AccentViolet else Color(0xCC121218))
+                            .border(0.75.dp, Color.White.copy(alpha = 0.25f), RoundedCornerShape(14.dp))
+                            .clickable {
+                                isPlayingLiveMotion = false
+                                showKeyPhotoPicker = !showKeyPhotoPicker
+                            }
+                            .padding(horizontal = 10.dp, vertical = 5.dp)
+                    ) {
+                        Text(
+                            text = "Key Photo",
+                            color = Color.White,
+                            fontSize = 10.sp,
+                            fontWeight = FontWeight.SemiBold
+                        )
+                    }
+
+                    Box(
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(14.dp))
+                            .background(Color(0xCC121218))
+                            .border(0.75.dp, Color.White.copy(alpha = 0.25f), RoundedCornerShape(14.dp))
+                            .clickable { onExportLiveVideo() }
+                            .padding(horizontal = 9.dp, vertical = 5.dp)
+                    ) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Icon(
+                                imageVector = Icons.Default.Movie,
+                                contentDescription = "Save Video",
+                                tint = Color.White,
+                                modifier = Modifier.size(13.dp)
+                            )
+                            Spacer(modifier = Modifier.width(4.dp))
+                            Text(
+                                text = "MP4",
+                                color = Color.White,
+                                fontSize = 10.sp,
+                                fontWeight = FontWeight.SemiBold
+                            )
+                        }
+                    }
+                }
+            }
+
+            // Key Photo Scrubber Overlay at Bottom of Card when picking the sharpest Live frame!
+            if (showKeyPhotoPicker && liveKeyFrames.isNotEmpty()) {
+                Column(
+                    modifier = Modifier
+                        .align(Alignment.BottomCenter)
+                        .fillMaxWidth()
+                        .padding(10.dp)
+                        .clip(RoundedCornerShape(16.dp))
+                        .background(Color(0xDD101118))
+                        .border(0.75.dp, TrueLensPalette.AccentViolet.copy(alpha = 0.7f), RoundedCornerShape(16.dp))
+                        .padding(10.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            text = "Pick Sharpest Key Photo (${selectedKeyFrameIdx + 1}/${liveKeyFrames.size})",
+                            color = Color.White,
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.SemiBold
+                        )
+                        Box(
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(10.dp))
+                                .background(Color.White)
+                                .clickable {
+                                    val chosen = liveKeyFrames[selectedKeyFrameIdx.coerceIn(0, liveKeyFrames.lastIndex)].second
+                                    showKeyPhotoPicker = false
+                                    onSaveKeyPhoto(chosen)
+                                }
+                                .padding(horizontal = 11.dp, vertical = 5.dp)
+                        ) {
+                            Text("Save Key Photo", color = Color.Black, fontSize = 10.sp, fontWeight = FontWeight.Bold)
+                        }
+                    }
+                    LazyRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        items(liveKeyFrames.indices.toList()) { idx ->
+                            val isSel = idx == selectedKeyFrameIdx
+                            Image(
+                                bitmap = liveKeyFrames[idx].second.asImageBitmap(),
+                                contentDescription = "Key Frame $idx",
+                                contentScale = ContentScale.Crop,
+                                modifier = Modifier
+                                    .width(44.dp)
+                                    .height(54.dp)
+                                    .clip(RoundedCornerShape(8.dp))
+                                    .border(
+                                        width = if (isSel) 2.dp else 0.75.dp,
+                                        color = if (isSel) Color(0xFFFFB300) else Color.White.copy(alpha = 0.2f),
+                                        shape = RoundedCornerShape(8.dp)
+                                    )
+                                    .clickable { selectedKeyFrameIdx = idx }
+                            )
+                        }
+                    }
+                }
+            }
+
+            // Floating Before/After Compare Button at bottom-right of photo (hidden during Live playback / Key Photo scrubber)
+            if (!showKeyPhotoPicker && !isPlayingLiveMotion) {
+                Box(
+                    modifier = Modifier
+                        .align(Alignment.BottomEnd)
+                        .padding(14.dp)
+                        .size(38.dp)
+                        .clip(RoundedCornerShape(12.dp))
+                        .background(if (showOriginal) TrueLensPalette.AccentViolet else Color(0xAA141418))
+                        .pointerInput(Unit) {
+                            detectTapGestures(
+                                onPress = {
+                                    showOriginal = true
+                                    tryAwaitRelease()
+                                    showOriginal = false
+                                }
+                            )
+                        },
+                    contentAlignment = Alignment.Center
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.Compare,
+                        contentDescription = "Hold to Compare Original",
+                        tint = Color.White,
+                        modifier = Modifier.size(19.dp)
+                    )
+                }
             }
         }
 
@@ -409,6 +641,12 @@ fun DarkroomScreen(
                                     preset.id.contains("editorial") -> "Editorial"
                                     preset.id.contains("academia") -> "Academia"
                                     preset.id.contains("hp5") -> "HP5 B&W"
+                                    preset.id == "halation_800t" -> "800T Halo"
+                                    preset.id == "leak_warm" -> "Warm Leak"
+                                    preset.id == "leak_amber" -> "Amber '89"
+                                    preset.id == "leak_rose" -> "Rose Prism"
+                                    preset.id == "leak_sunset" -> "Sunset"
+                                    preset.id == "vhs_94" -> "VHS '94"
                                     else -> preset.name.take(10)
                                 }
                                 Text(
@@ -637,6 +875,16 @@ fun DarkroomScreen(
                     Text("Cancel", color = Color.White)
                 }
             }
+        )
+    }
+
+    val exifUri = state.darkroomSourceUri ?: state.lastCapturedPhoto?.jpegUri
+    if (showExifDialog && exifUri != null) {
+        MediaInfoSheetDialog(
+            uri = exifUri,
+            isVideo = false,
+            fallbackName = "TrueLens Photo",
+            onDismiss = { showExifDialog = false }
         )
     }
 }

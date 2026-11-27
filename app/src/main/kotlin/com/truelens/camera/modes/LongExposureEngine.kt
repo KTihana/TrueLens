@@ -50,14 +50,16 @@ object LongExposureEngine {
     ): Uri? = withContext(Dispatchers.Default) {
         if (frames.isEmpty()) return@withContext null
 
-        val w = frames.first().width
-        val h = frames.first().height
+        val ref = frames.first()
+        val w = ref.width
+        val h = ref.height
         val size = w * h
         val count = frames.size
 
         val rAcc = FloatArray(size)
         val gAcc = FloatArray(size)
         val bAcc = FloatArray(size)
+        val wAcc = FloatArray(size)
         val rowBuf = IntArray(size)
 
         for (i in 0 until count) {
@@ -66,35 +68,57 @@ object LongExposureEngine {
             } else {
                 frames[i]
             }
+            // Anti-shake alignment against Frame #1 cancels tripod wind/vibration!
+            val (dx, dy) = if (i == 0) 0 to 0 else AstroSkyEngine.estimateFrameShift(ref, bmp, maxShiftPx = 20)
             bmp.getPixels(rowBuf, 0, w, 0, 0, w, h)
             if (bmp !== frames[i]) bmp.recycle()
 
             if (style == LongExposureStyle.SILKY_WATER) {
-                for (p in 0 until size) {
-                    val c = rowBuf[p]
-                    rAcc[p] += ((c ushr 16) and 0xFF)
-                    gAcc[p] += ((c ushr 8) and 0xFF)
-                    bAcc[p] += (c and 0xFF)
+                for (y in 0 until h) {
+                    val sy = y + dy
+                    if (sy !in 0 until h) continue
+                    val dRow = y * w
+                    val sRow = sy * w
+                    for (x in 0 until w) {
+                        val sx = x + dx
+                        if (sx !in 0 until w) continue
+                        val c = rowBuf[sRow + sx]
+                        val p = dRow + x
+                        rAcc[p] += ((c ushr 16) and 0xFF)
+                        gAcc[p] += ((c ushr 8) and 0xFF)
+                        bAcc[p] += (c and 0xFF)
+                        wAcc[p] += 1f
+                    }
                 }
             } else {
-                // Light Trails (Max-lighten blend)
-                for (p in 0 until size) {
-                    val c = rowBuf[p]
-                    val r = ((c ushr 16) and 0xFF).toFloat()
-                    val g = ((c ushr 8) and 0xFF).toFloat()
-                    val b = (c and 0xFF).toFloat()
-                    rAcc[p] = max(rAcc[p], r)
-                    gAcc[p] = max(gAcc[p], g)
-                    bAcc[p] = max(bAcc[p], b)
+                // Light Trails (Anti-shake aligned Max-lighten blend)
+                for (y in 0 until h) {
+                    val sy = y + dy
+                    if (sy !in 0 until h) continue
+                    val dRow = y * w
+                    val sRow = sy * w
+                    for (x in 0 until w) {
+                        val sx = x + dx
+                        if (sx !in 0 until w) continue
+                        val c = rowBuf[sRow + sx]
+                        val p = dRow + x
+                        val r = ((c ushr 16) and 0xFF).toFloat()
+                        val g = ((c ushr 8) and 0xFF).toFloat()
+                        val b = (c and 0xFF).toFloat()
+                        rAcc[p] = max(rAcc[p], r)
+                        gAcc[p] = max(gAcc[p], g)
+                        bAcc[p] = max(bAcc[p], b)
+                        wAcc[p] = 1f
+                    }
                 }
             }
         }
 
-        val invCount = if (style == LongExposureStyle.SILKY_WATER) 1f / count else 1f
         val outPixels = IntArray(size) { p ->
-            val r = (rAcc[p] * invCount).toInt().coerceIn(0, 255)
-            val g = (gAcc[p] * invCount).toInt().coerceIn(0, 255)
-            val b = (bAcc[p] * invCount).toInt().coerceIn(0, 255)
+            val inv = if (style == LongExposureStyle.SILKY_WATER) 1f / wAcc[p].coerceAtLeast(1f) else 1f
+            val r = (rAcc[p] * inv).toInt().coerceIn(0, 255)
+            val g = (gAcc[p] * inv).toInt().coerceIn(0, 255)
+            val b = (bAcc[p] * inv).toInt().coerceIn(0, 255)
             (0xFF shl 24) or (r shl 16) or (g shl 8) or b
         }
 

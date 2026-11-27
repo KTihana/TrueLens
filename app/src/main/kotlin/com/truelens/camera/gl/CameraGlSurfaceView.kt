@@ -10,7 +10,9 @@ class CameraGlSurfaceView(
     context: Context,
     onSurfaceReady: (Surface) -> Unit,
     onHistogramSampled: ((FloatArray) -> Unit)? = null,
-    onPalmSampled: ((Bitmap) -> Unit)? = null
+    onPalmSampled: ((Bitmap) -> Unit)? = null,
+    onScannerSampled: ((Bitmap) -> Unit)? = null,
+    onLivePhotoSampled: ((Bitmap) -> Unit)? = null
 ) : GLSurfaceView(context) {
 
     val renderer: LiveGradingRenderer
@@ -21,10 +23,19 @@ class CameraGlSurfaceView(
             onSurfaceReady = onSurfaceReady,
             requestRenderCallback = { requestRender() },
             onHistogramSampled = onHistogramSampled,
-            onPalmSampled = onPalmSampled
+            onPalmSampled = onPalmSampled,
+            onScannerSampled = onScannerSampled,
+            onLivePhotoSampled = onLivePhotoSampled
         )
         setRenderer(renderer)
         renderMode = RENDERMODE_WHEN_DIRTY
+    }
+
+    fun updateBokeh(strength: Float, focusX: Float, focusY: Float) {
+        renderer.bokehStrength = strength
+        renderer.bokehTargetX = focusX
+        renderer.bokehTargetY = focusY
+        requestRender()
     }
 
     fun configureCameraGeometry(width: Int, height: Int, sensorOrientation: Int) {

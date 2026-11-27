@@ -26,17 +26,24 @@ data class LightroomGrade(
     // 3-Point Tone Curve
     val curveShadows: Float = 0f,  // -0.5 .. +0.5
     val curveMidtones: Float = 0f, // -0.5 .. +0.5
-    val curveHighlights: Float = 0f // -0.5 .. +0.5
+    val curveHighlights: Float = 0f, // -0.5 .. +0.5
+    // Optional Analog & Retro Effects (OFF by default — never applied unless chosen!)
+    val halation: Float = 0f,           // 0.0 .. 1.0 (CineStill-style red/orange highlight bloom)
+    val lightLeakStyle: Int = 0,        // 0=None, 1=Warm Left, 2=Amber Corner, 3=Rose Prism, 4=Golden Edge, 5=Sunset Dual
+    val lightLeakIntensity: Float = 0f, // 0.0 .. 1.0
+    val vhsRetro: Float = 0f            // 0.0 .. 1.0 (90s VHS scanlines, chroma bleed & warm tape)
 ) {
     val isNeutral: Boolean
         get() = exposure == 0f && contrast == 0f && highlights == 0f && shadows == 0f &&
             whites == 0f && blacks == 0f && temperature == 0f && tint == 0f &&
             vibrance == 0f && saturation == 0f && clarity == 0f && vignette == 0f && grain == 0f &&
             hslRedSat == 0f && hslSkinLum == 0f && hslGreenSat == 0f && hslBlueSat == 0f &&
-            hslBlueLum == 0f && curveShadows == 0f && curveMidtones == 0f && curveHighlights == 0f
+            hslBlueLum == 0f && curveShadows == 0f && curveMidtones == 0f && curveHighlights == 0f &&
+            halation == 0f && lightLeakStyle == 0 && lightLeakIntensity == 0f && vhsRetro == 0f
 
     companion object {
         val NEUTRAL = LightroomGrade()
+        val LIGHT_LEAK_LABELS = listOf("None", "Warm Left", "Amber Corner", "Rose Prism", "Golden Edge", "Sunset Dual")
     }
 }
 
@@ -205,6 +212,104 @@ object BuiltInPresets {
                 clarity = 0.20f,
                 vignette = 0.18f,
                 grain = 0.28f
+            )
+        ),
+        GradePreset(
+            id = "halation_800t",
+            name = "800T Halation",
+            category = "ANALOG",
+            subtitle = "CineStill tungsten with glowing red-orange highlight bloom",
+            grade = LightroomGrade(
+                contrast = 0.14f,
+                highlights = -0.14f,
+                shadows = 0.16f,
+                temperature = -0.22f,
+                tint = 0.05f,
+                vibrance = 0.14f,
+                vignette = 0.18f,
+                grain = 0.24f,
+                halation = 0.72f
+            )
+        ),
+        GradePreset(
+            id = "leak_warm_left",
+            name = "Warm Film Leak",
+            category = "LEAKS",
+            subtitle = "35mm analog warm red-orange side light burn",
+            grade = LightroomGrade(
+                exposure = 0.05f,
+                contrast = 0.10f,
+                shadows = 0.14f,
+                temperature = 0.18f,
+                grain = 0.22f,
+                halation = 0.25f,
+                lightLeakStyle = 1,
+                lightLeakIntensity = 0.65f
+            )
+        ),
+        GradePreset(
+            id = "leak_amber_corner",
+            name = "Amber '89",
+            category = "LEAKS",
+            subtitle = "Nostalgic warm corner flare & soft grain",
+            grade = LightroomGrade(
+                contrast = 0.08f,
+                highlights = -0.16f,
+                shadows = 0.18f,
+                temperature = 0.22f,
+                grain = 0.20f,
+                lightLeakStyle = 2,
+                lightLeakIntensity = 0.68f
+            )
+        ),
+        GradePreset(
+            id = "leak_rose_prism",
+            name = "Rose Prism",
+            category = "LEAKS",
+            subtitle = "Dreamy peach-rose optical leak & highlight bloom",
+            grade = LightroomGrade(
+                exposure = 0.08f,
+                contrast = -0.04f,
+                shadows = 0.20f,
+                temperature = 0.10f,
+                tint = 0.14f,
+                grain = 0.16f,
+                halation = 0.45f,
+                lightLeakStyle = 3,
+                lightLeakIntensity = 0.62f
+            )
+        ),
+        GradePreset(
+            id = "leak_sunset_dual",
+            name = "Sunset Burn",
+            category = "LEAKS",
+            subtitle = "Dual-edge golden hour analog film leak",
+            grade = LightroomGrade(
+                contrast = 0.14f,
+                highlights = -0.18f,
+                shadows = 0.12f,
+                temperature = 0.26f,
+                grain = 0.22f,
+                halation = 0.35f,
+                lightLeakStyle = 5,
+                lightLeakIntensity = 0.64f
+            )
+        ),
+        GradePreset(
+            id = "vhs_94_tape",
+            name = "VHS '94",
+            category = "RETRO",
+            subtitle = "90s camcorder scanlines, chroma bleed & warm tape",
+            grade = LightroomGrade(
+                contrast = 0.12f,
+                highlights = -0.10f,
+                shadows = 0.14f,
+                temperature = 0.16f,
+                tint = 0.06f,
+                saturation = -0.12f,
+                vignette = 0.24f,
+                grain = 0.32f,
+                vhsRetro = 0.85f
             )
         )
     )

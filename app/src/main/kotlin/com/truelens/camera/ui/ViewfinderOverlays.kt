@@ -158,8 +158,48 @@ fun LiveHistogramView(
 @Composable
 fun HorizonLevelOverlay(
     rollDegrees: Float,
+    isFlatLay: Boolean = false,
+    flatTiltX: Float = 0f,
+    flatTiltY: Float = 0f,
     modifier: Modifier = Modifier
 ) {
+    if (isFlatLay) {
+        // Feature #6: Top-Down Flat-Lay Dual Crosshair Level (food, desk flat-lays, documents)
+        val dist = kotlin.math.hypot(flatTiltX.toDouble(), flatTiltY.toDouble()).toFloat()
+        val isLevel = dist < 0.35f
+        val activeColor = if (isLevel) Color(0xFF34D399) else Color(0xFFFFD60A)
+        Canvas(modifier = modifier.width(120.dp).height(120.dp)) {
+            val cx = size.width / 2f
+            val cy = size.height / 2f
+            val arm = 18.dp.toPx()
+            val stroke = 2.dp.toPx()
+
+            // Fixed center reference crosshair
+            val refColor = if (isLevel) Color(0xFF34D399) else Color.White.copy(alpha = 0.72f)
+            drawLine(refColor, Offset(cx - arm, cy), Offset(cx + arm, cy), stroke)
+            drawLine(refColor, Offset(cx, cy - arm), Offset(cx, cy + arm), stroke)
+
+            // Dynamic tilt crosshair (moves toward center and locks green when perfectly flat!)
+            val maxShift = 38.dp.toPx()
+            val ox = (flatTiltX * 10.dp.toPx()).coerceIn(-maxShift, maxShift)
+            val oy = (flatTiltY * 10.dp.toPx()).coerceIn(-maxShift, maxShift)
+            val dx = if (isLevel) cx else cx + ox
+            val dy = if (isLevel) cy else cy + oy
+            val dynArm = 14.dp.toPx()
+            drawLine(activeColor, Offset(dx - dynArm, dy), Offset(dx + dynArm, dy), stroke)
+            drawLine(activeColor, Offset(dx, dy - dynArm), Offset(dx, dy + dynArm), stroke)
+            if (isLevel) {
+                drawCircle(
+                    color = Color(0xFF34D399).copy(alpha = 0.85f),
+                    radius = 24.dp.toPx(),
+                    center = Offset(cx, cy),
+                    style = Stroke(width = 1.5.dp.toPx())
+                )
+            }
+        }
+        return
+    }
+
     val isLevel = abs(rollDegrees) < 1.5f
     val color = if (isLevel) Color(0xFF34D399) else Color.White.copy(alpha = 0.65f)
     Canvas(modifier = modifier.width(120.dp).height(24.dp)) {
@@ -180,6 +220,41 @@ fun HorizonLevelOverlay(
             end = Offset(cx + dx, cy + dy),
             strokeWidth = 2.dp.toPx()
         )
+    }
+}
+
+/**
+ * iPhone-style 4 animated golden corner brackets locked directly onto a detected QR code in the viewfinder.
+ */
+@Composable
+fun QrBracketsOverlay(
+    qr: com.truelens.camera.modes.DetectedQrCode?,
+    modifier: Modifier = Modifier
+) {
+    val box = qr?.normalizedBox ?: return
+    Canvas(modifier = modifier.fillMaxSize()) {
+        val left = (box.left * size.width).coerceIn(0f, size.width)
+        val top = (box.top * size.height).coerceIn(0f, size.height)
+        val right = (box.right * size.width).coerceIn(left + 12f, size.width)
+        val bottom = (box.bottom * size.height).coerceIn(top + 12f, size.height)
+        val bw = right - left
+        val bh = bottom - top
+        val corner = (minOf(bw, bh) * 0.24f).coerceIn(14.dp.toPx(), 32.dp.toPx())
+        val stroke = 3.dp.toPx()
+        val col = Color(0xFFFFD60A)
+
+        // Top-left
+        drawLine(col, Offset(left, top), Offset(left + corner, top), stroke)
+        drawLine(col, Offset(left, top), Offset(left, top + corner), stroke)
+        // Top-right
+        drawLine(col, Offset(right, top), Offset(right - corner, top), stroke)
+        drawLine(col, Offset(right, top), Offset(right, top + corner), stroke)
+        // Bottom-left
+        drawLine(col, Offset(left, bottom), Offset(left + corner, bottom), stroke)
+        drawLine(col, Offset(left, bottom), Offset(left, bottom - corner), stroke)
+        // Bottom-right
+        drawLine(col, Offset(right, bottom), Offset(right - corner, bottom), stroke)
+        drawLine(col, Offset(right, bottom), Offset(right, bottom - corner), stroke)
     }
 }
 

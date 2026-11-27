@@ -8,34 +8,48 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.AspectRatio
+import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.BarChart
 import androidx.compose.material.icons.filled.BurstMode
 import androidx.compose.material.icons.filled.CalendarToday
 import androidx.compose.material.icons.filled.CenterFocusStrong
 import androidx.compose.material.icons.filled.Flip
+import androidx.compose.material.icons.filled.GraphicEq
 import androidx.compose.material.icons.filled.GridOn
+import androidx.compose.material.icons.filled.MotionPhotosOn
+import androidx.compose.material.icons.filled.NightsStay
 import androidx.compose.material.icons.filled.PanTool
+import androidx.compose.material.icons.filled.QrCodeScanner
+import androidx.compose.material.icons.filled.RadioButtonChecked
 import androidx.compose.material.icons.filled.RawOn
 import androidx.compose.material.icons.filled.Straighten
+import androidx.compose.material.icons.filled.TextFields
 import androidx.compose.material.icons.filled.Timer
+import androidx.compose.material.icons.filled.VolumeOff
+import androidx.compose.material.icons.filled.VolumeUp
 import androidx.compose.material.icons.filled.WbSunny
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.unit.dp
 import com.truelens.camera.camera.AspectRatioMask
+import com.truelens.camera.camera.EnhanceMode
 import com.truelens.camera.camera.GridOverlay
 import com.truelens.camera.camera.HandsFreeMode
 import com.truelens.camera.camera.ManualSettings
+import com.truelens.camera.camera.NightModeDuration
 import com.truelens.camera.grading.DateStampStyle
 
 /**
- * Translucent 4-column Camera Tools grid (3 balanced rows, 12 clean options).
- * TrueLens is permanently 100% Zero-AI pure optics — AI isn't even an option!
+ * Translucent 4-column Camera Tools grid (4 balanced rows, 16 clean options).
+ * Pure Zero-AI optics is ALWAYS default; optional Clean Enhance gives gentle denoise & clarity!
  */
 @Composable
 fun QuickToolsSheet(
@@ -53,22 +67,57 @@ fun QuickToolsSheet(
     onToggleFocusEdges: () -> Unit,
     onCycleDateStamp: () -> Unit,
     onCycleHandsFree: () -> Unit,
+    onToggleEnhanceMode: () -> Unit,
+    onToggleLivePhoto: () -> Unit,
+    onCycleNightMode: () -> Unit,
+    onToggleQrScanner: () -> Unit,
+    onToggleLiveText: () -> Unit,
+    onToggleShutterSound: () -> Unit = {},
+    onToggleFloatingShutter: () -> Unit = {},
+    onToggleAudioMeter: () -> Unit = {},
+    onToggleAutoNightPrompt: () -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     Column(
         modifier = modifier
             .fillMaxWidth()
-            .padding(horizontal = 16.dp)
+            .heightIn(max = 450.dp)
+            .padding(horizontal = 14.dp)
             .clip(RoundedCornerShape(22.dp))
             .background(TrueLensPalette.GlassPanel)
             .border(0.75.dp, TrueLensPalette.GlassBorder, RoundedCornerShape(22.dp))
-            .padding(horizontal = 8.dp, vertical = 10.dp)
+            .verticalScroll(rememberScrollState())
+            .padding(horizontal = 8.dp, vertical = 8.dp)
     ) {
-        // Row 1: Format, Ratio, Timer, Grid
+        // Row 1: Clean Enhance, Live Photo, Night Stack, Format
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.spacedBy(4.dp)
         ) {
+            GlassGridTile(
+                icon = Icons.Default.AutoAwesome,
+                label = "Clean Look",
+                valueText = settings.enhanceMode.label,
+                active = settings.enhanceMode == EnhanceMode.CLEAN,
+                onClick = onToggleEnhanceMode,
+                modifier = Modifier.weight(1f)
+            )
+            GlassGridTile(
+                icon = Icons.Default.MotionPhotosOn,
+                label = "Live Photo",
+                valueText = if (settings.livePhotoEnabled) "On" else "Off",
+                active = settings.livePhotoEnabled,
+                onClick = onToggleLivePhoto,
+                modifier = Modifier.weight(1f)
+            )
+            GlassGridTile(
+                icon = Icons.Default.NightsStay,
+                label = "Night",
+                valueText = settings.nightModeDuration.label,
+                active = settings.nightModeDuration != NightModeDuration.OFF,
+                onClick = onCycleNightMode,
+                modifier = Modifier.weight(1f)
+            )
             GlassGridTile(
                 icon = Icons.Default.RawOn,
                 label = "Format",
@@ -77,6 +126,15 @@ fun QuickToolsSheet(
                 onClick = onCycleFormat,
                 modifier = Modifier.weight(1f)
             )
+        }
+
+        Spacer(modifier = Modifier.height(4.dp))
+
+        // Row 2: Ratio, Timer, Grid, Level (Horizon + Flat-Lay)
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(4.dp)
+        ) {
             GlassGridTile(
                 icon = Icons.Default.AspectRatio,
                 label = "Ratio",
@@ -101,15 +159,39 @@ fun QuickToolsSheet(
                 onClick = onCycleGrid,
                 modifier = Modifier.weight(1f)
             )
+            GlassGridTile(
+                icon = Icons.Default.Straighten,
+                label = "Level",
+                valueText = if (settings.levelGauge) "On" else "Off",
+                active = settings.levelGauge,
+                onClick = onToggleLevel,
+                modifier = Modifier.weight(1f)
+            )
         }
 
         Spacer(modifier = Modifier.height(4.dp))
 
-        // Row 2: Hands-Free, Date Stamp, Burst, Selfie Mirror
+        // Row 3: QR Scan, Live Text, Hands-Free, Date Stamp
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.spacedBy(4.dp)
         ) {
+            GlassGridTile(
+                icon = Icons.Default.QrCodeScanner,
+                label = "QR Scan",
+                valueText = if (settings.qrScannerEnabled) "Auto" else "Off",
+                active = settings.qrScannerEnabled,
+                onClick = onToggleQrScanner,
+                modifier = Modifier.weight(1f)
+            )
+            GlassGridTile(
+                icon = Icons.Default.TextFields,
+                label = "Live Text",
+                valueText = if (settings.liveTextEnabled) "Auto" else "Off",
+                active = settings.liveTextEnabled,
+                onClick = onToggleLiveText,
+                modifier = Modifier.weight(1f)
+            )
             GlassGridTile(
                 icon = Icons.Default.PanTool,
                 label = "Hands-Free",
@@ -126,6 +208,15 @@ fun QuickToolsSheet(
                 onClick = onCycleDateStamp,
                 modifier = Modifier.weight(1f)
             )
+        }
+
+        Spacer(modifier = Modifier.height(4.dp))
+
+        // Row 4: Burst, Selfie Mirror, Auto Light, Graph / Focus Edge
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(4.dp)
+        ) {
             GlassGridTile(
                 icon = Icons.Default.BurstMode,
                 label = "Burst",
@@ -142,15 +233,6 @@ fun QuickToolsSheet(
                 onClick = onToggleMirrorFront,
                 modifier = Modifier.weight(1f)
             )
-        }
-
-        Spacer(modifier = Modifier.height(4.dp))
-
-        // Row 3: Auto Light, Level, Graph, Focus Edge
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(4.dp)
-        ) {
             GlassGridTile(
                 icon = Icons.Default.WbSunny,
                 label = "Auto Light",
@@ -160,27 +242,52 @@ fun QuickToolsSheet(
                 modifier = Modifier.weight(1f)
             )
             GlassGridTile(
-                icon = Icons.Default.Straighten,
-                label = "Level",
-                valueText = if (settings.levelGauge) "On" else "Off",
-                active = settings.levelGauge,
-                onClick = onToggleLevel,
-                modifier = Modifier.weight(1f)
-            )
-            GlassGridTile(
-                icon = Icons.Default.BarChart,
-                label = "Graph",
-                valueText = if (settings.histogram) "On" else "Off",
-                active = settings.histogram,
-                onClick = onToggleHistogram,
-                modifier = Modifier.weight(1f)
-            )
-            GlassGridTile(
                 icon = Icons.Default.CenterFocusStrong,
                 label = "Focus Edge",
-                valueText = if (settings.focusPeaking) "On" else "Off",
-                active = settings.focusPeaking,
+                valueText = if (settings.focusPeaking) "On" else if (settings.histogram) "Graph" else "Off",
+                active = settings.focusPeaking || settings.histogram,
                 onClick = onToggleFocusEdges,
+                modifier = Modifier.weight(1f)
+            )
+        }
+
+        Spacer(modifier = Modifier.height(4.dp))
+
+        // Row 5: Shutter Sound, Floating Shutter, Audio dB Meter, Auto Night Light Badge
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(4.dp)
+        ) {
+            GlassGridTile(
+                icon = if (settings.shutterSoundEnabled) Icons.Default.VolumeUp else Icons.Default.VolumeOff,
+                label = "Shutter",
+                valueText = if (settings.shutterSoundEnabled) "Sound" else "Silent",
+                active = settings.shutterSoundEnabled,
+                onClick = onToggleShutterSound,
+                modifier = Modifier.weight(1f)
+            )
+            GlassGridTile(
+                icon = Icons.Default.RadioButtonChecked,
+                label = "Float Btn",
+                valueText = if (settings.floatingShutterEnabled) "On" else "Off",
+                active = settings.floatingShutterEnabled,
+                onClick = onToggleFloatingShutter,
+                modifier = Modifier.weight(1f)
+            )
+            GlassGridTile(
+                icon = Icons.Default.GraphicEq,
+                label = "dB Meter",
+                valueText = if (settings.audioMeterEnabled) "On" else "Off",
+                active = settings.audioMeterEnabled,
+                onClick = onToggleAudioMeter,
+                modifier = Modifier.weight(1f)
+            )
+            GlassGridTile(
+                icon = Icons.Default.NightsStay,
+                label = "Auto Night",
+                valueText = if (settings.autoNightPromptEnabled) "On" else "Off",
+                active = settings.autoNightPromptEnabled,
+                onClick = onToggleAutoNightPrompt,
                 modifier = Modifier.weight(1f)
             )
         }

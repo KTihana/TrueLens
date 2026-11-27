@@ -7,6 +7,7 @@ import android.content.Context
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.media.MediaActionSound
 import android.net.Uri
 import android.os.Environment
 import android.provider.MediaStore
@@ -16,21 +17,26 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.truelens.camera.camera.AebMode
 import com.truelens.camera.camera.AspectRatioMask
+import com.truelens.camera.camera.AstroStyle
 import com.truelens.camera.camera.CaptureFormat
 import com.truelens.camera.camera.CapturedPhoto
 import com.truelens.camera.camera.DocumentScanStyle
+import com.truelens.camera.camera.DoubleExpBlendMode
 import com.truelens.camera.camera.ExposureMode
 import com.truelens.camera.camera.GridOverlay
 import com.truelens.camera.camera.LensInfo
 import com.truelens.camera.camera.LiveTelemetry
 import com.truelens.camera.camera.ManualSettings
 import com.truelens.camera.camera.ShootingMode
+import com.truelens.camera.camera.SkyPreset
 import com.truelens.camera.camera.SoloBurstCount
 import com.truelens.camera.camera.StabilizerMode
 import com.truelens.camera.camera.TimerDuration
 import com.truelens.camera.camera.TrueLensCameraEngine
 import com.truelens.camera.camera.TrueLightAnalysis
 import com.truelens.camera.camera.TrueLightAutoMeter
+import com.truelens.camera.camera.VideoAudioMode
+import com.truelens.camera.camera.VideoQuality
 import com.truelens.camera.grading.BitmapGrader
 import com.truelens.camera.grading.BuiltInPresets
 import com.truelens.camera.grading.CubeLut
@@ -120,15 +126,44 @@ data class CameraUiState(
     val countdownRemainingSec: Int = 0,
     // Video / Slow-Mo / Document Scanner / Canon C1-C3 / Stop-Mo / Bulb / LUT / Focus Stack
     val isVideoRecording: Boolean = false,
+    val isVideoPaused: Boolean = false,
     val videoElapsedSec: Int = 0,
     val videoFpsBadge: String = "1080p",
     val isScanningDocument: Boolean = false,
+    // Automatic QR Scanner, Live Text, Night Mode, Live Photos, Portrait & Cinematic Rack Focus
+    val detectedQr: com.truelens.camera.modes.DetectedQrCode? = null,
+    val stickyQr: com.truelens.camera.modes.DetectedQrCode? = null,
+    val detectedLiveText: com.truelens.camera.modes.DetectedLiveText? = null,
+    val isLiveTextSheetOpen: Boolean = false,
+    val isNightStacking: Boolean = false,
+    val nightStackProgress: Float = 0f,
+    val isDarkLowLightScene: Boolean = false,
+    val isPortraitProcessing: Boolean = false,
+    val rackFocusNormX: Float = 0.5f,
+    val rackFocusNormY: Float = 0.45f,
+    val darkroomLiveVideoFile: java.io.File? = null,
     val savedCanonSlots: Set<String> = emptySet(),
     val stopMotionState: StopMotionState = StopMotionState(),
     val longExposureState: LongExposureState = LongExposureState(),
     val isFocusStacking: Boolean = false,
     val activeLut: CubeLut? = null,
     val splitScreenPosition: Float = 0.5f,
+    // Audio dB meter, Floating shutter, Double Exposure, Astrophotography, Action Pan, VHS bake
+    val audioLevel01: Float = 0f,
+    val audioPeakDb: Float = -60f,
+    val floatingShutterX: Float = 0.80f,
+    val floatingShutterY: Float = 0.62f,
+    val doubleExpFirstShot: Bitmap? = null,
+    val doubleExpWeight: Float = 0.5f,
+    val isProcessingDoubleExp: Boolean = false,
+    val isAstroCapturing: Boolean = false,
+    val astroPhaseLabel: String = "",
+    val astroProgress: Float = 0f,
+    val astroKeptFrames: Int = 0,
+    val astroDroppedFrames: Int = 0,
+    val isPhoneSteady: Boolean = true,
+    val isActionPanProcessing: Boolean = false,
+    val isBakingVhs: Boolean = false,
     // Pose Overlay & Pose Inspos Library
     val isPoseInsposOpen: Boolean = false,
     val poseFolders: List<PoseFolder> = emptyList(),
@@ -150,6 +185,30 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
     private val customPresetRepo = CustomPresetRepository(application)
     val pinterestImporter = PinterestImporter(application)
     private val dualCameraController = com.truelens.camera.camera.DualCameraController(application)
+    private val livePhotoController = com.truelens.camera.modes.LivePhotoController(application)
+    private var pendingLivePhotoName: String? = null
+    private var stickyQrClearJob: Job? = null
+    private val viewfinderScanner = com.truelens.camera.modes.ViewfinderScannerController(
+        onQrDetected = { qr ->
+            if (qr != null) {
+                stickyQrClearJob?.cancel()
+                _uiState.update { it.copy(detectedQr = qr, stickyQr = qr) }
+                stickyQrClearJob = viewModelScope.launch {
+                    delay(3500)
+                    _uiState.update { cur ->
+                        if (cur.detectedQr == null) cur.copy(stickyQr = null) else cur
+                    }
+                }
+            } else {
+                _uiState.update { it.copy(detectedQr = null) }
+            }
+        },
+        onTextDetected = { txt ->
+            _uiState.update { cur ->
+                if (cur.isLiveTextSheetOpen) cur else cur.copy(detectedLiveText = txt)
+            }
+        }
+    )
     private val handsFreeController = com.truelens.camera.modes.HandsFreeShutterController(
         context = application,
         onTriggered = { reason -> onHandsFreeTriggered(reason) },
@@ -178,17 +237,156 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
     private var timeLapseJob: Job? = null
     private var timerJob: Job? = null
     private var videoTimerJob: Job? = null
+    private var videoMeterJob: Job? = null
+    private var astroJob: Job? = null
     private var bannerJob: Job? = null
     private var darkroomPreviewJob: Job? = null
     private val canonSlotPrefs = application.getSharedPreferences("truelens_canon_slots", Context.MODE_PRIVATE)
+    private val appPrefs = application.getSharedPreferences("truelens_prefs", Context.MODE_PRIVATE)
+    private val actionSound: MediaActionSound? = runCatching {
+        MediaActionSound().apply {
+            load(MediaActionSound.SHUTTER_CLICK)
+            load(MediaActionSound.START_VIDEO_RECORDING)
+            load(MediaActionSound.STOP_VIDEO_RECORDING)
+        }
+    }.getOrNull()
+    private val audioMeterController = com.truelens.camera.modes.AudioMeterController(viewModelScope) { norm, db ->
+        _uiState.update { it.copy(audioLevel01 = norm, audioPeakDb = db) }
+    }
+    @Volatile private var latestGyroMag: Float = 0f
+    @Volatile private var peakGyroDuringCapture: Float = 0f
+    private var lastGyroUiUpdateMs: Long = 0L
 
     init {
+        loadPersistedSettings()
         loadPoseFolders()
         refreshLatestThumbnail()
         viewModelScope.launch {
             val saved = customPresetRepo.loadCustomPresets()
             val slots = setOf("C1", "C2", "C3").filter { canonSlotPrefs.contains("${it}_mode") }.toSet()
             _uiState.update { it.copy(customPresets = saved, savedCanonSlots = slots) }
+        }
+    }
+
+    private fun loadPersistedSettings() {
+        val grid = runCatching {
+            GridOverlay.valueOf(appPrefs.getString("gridOverlay", GridOverlay.RULE_OF_THIRDS.name)!!)
+        }.getOrDefault(GridOverlay.RULE_OF_THIRDS)
+        val vq = runCatching {
+            VideoQuality.valueOf(appPrefs.getString("videoQuality", VideoQuality.FHD_30.name)!!)
+        }.getOrDefault(VideoQuality.FHD_30)
+        val va = runCatching {
+            VideoAudioMode.valueOf(appPrefs.getString("videoAudioMode", VideoAudioMode.STEREO.name)!!)
+        }.getOrDefault(VideoAudioMode.STEREO)
+        val stab = runCatching {
+            StabilizerMode.valueOf(appPrefs.getString("stabilizerMode", StabilizerMode.SUPER_STEADY.name)!!)
+        }.getOrDefault(StabilizerMode.SUPER_STEADY)
+        val ds = runCatching {
+            com.truelens.camera.grading.DateStampStyle.valueOf(
+                appPrefs.getString("dateStampStyle", com.truelens.camera.grading.DateStampStyle.OFF.name)!!
+            )
+        }.getOrDefault(com.truelens.camera.grading.DateStampStyle.OFF)
+        val deBlend = runCatching {
+            DoubleExpBlendMode.valueOf(appPrefs.getString("doubleExpBlend", DoubleExpBlendMode.SCREEN.name)!!)
+        }.getOrDefault(DoubleExpBlendMode.SCREEN)
+        val astroStyle = runCatching {
+            AstroStyle.valueOf(appPrefs.getString("astroStyle", AstroStyle.PINPOINT_STARS.name)!!)
+        }.getOrDefault(AstroStyle.PINPOINT_STARS)
+
+        val liveOn = appPrefs.getBoolean("livePhotoEnabled", false)
+        livePhotoController.isEnabled = liveOn
+
+        _uiState.update { state ->
+            state.copy(
+                floatingShutterX = appPrefs.getFloat("floatingShutterX", 0.80f).coerceIn(0.08f, 0.92f),
+                floatingShutterY = appPrefs.getFloat("floatingShutterY", 0.62f).coerceIn(0.12f, 0.88f),
+                settings = state.settings.copy(
+                    gridOverlay = grid,
+                    trueLightAuto = appPrefs.getBoolean("trueLightAuto", true),
+                    autoNightPromptEnabled = appPrefs.getBoolean("autoNightPromptEnabled", true),
+                    qrScannerEnabled = appPrefs.getBoolean("qrScannerEnabled", true),
+                    liveTextEnabled = appPrefs.getBoolean("liveTextEnabled", true),
+                    livePhotoEnabled = liveOn,
+                    shutterSoundEnabled = appPrefs.getBoolean("shutterSoundEnabled", true),
+                    audioMeterEnabled = appPrefs.getBoolean("audioMeterEnabled", false),
+                    floatingShutterEnabled = appPrefs.getBoolean("floatingShutterEnabled", false),
+                    keepMusicPlaying = appPrefs.getBoolean("keepMusicPlaying", true),
+                    mirrorFrontSave = appPrefs.getBoolean("mirrorFrontSave", false),
+                    videoQuality = vq,
+                    videoAudioMode = va,
+                    micMuted = va == VideoAudioMode.MUTED,
+                    stabilizerMode = stab,
+                    cinema180Shutter = appPrefs.getBoolean("cinema180Shutter", false),
+                    dateStampStyle = ds,
+                    astroDurationSec = appPrefs.getInt("astroDurationSec", 30).coerceIn(15, 60),
+                    astroStyle = astroStyle,
+                    astroLightPollutionClean = appPrefs.getBoolean("astroLightPollutionClean", true),
+                    astroHotPixelClean = appPrefs.getBoolean("astroHotPixelClean", true),
+                    doubleExpBlend = deBlend,
+                    actionPanStrength = appPrefs.getFloat("actionPanStrength", 0.65f).coerceIn(0.2f, 1.0f)
+                )
+            )
+        }
+    }
+
+    private fun savePersistedSettings(s: ManualSettings) {
+        appPrefs.edit()
+            .putString("gridOverlay", s.gridOverlay.name)
+            .putBoolean("trueLightAuto", s.trueLightAuto)
+            .putBoolean("autoNightPromptEnabled", s.autoNightPromptEnabled)
+            .putBoolean("qrScannerEnabled", s.qrScannerEnabled)
+            .putBoolean("liveTextEnabled", s.liveTextEnabled)
+            .putBoolean("livePhotoEnabled", s.livePhotoEnabled)
+            .putBoolean("shutterSoundEnabled", s.shutterSoundEnabled)
+            .putBoolean("audioMeterEnabled", s.audioMeterEnabled)
+            .putBoolean("floatingShutterEnabled", s.floatingShutterEnabled)
+            .putBoolean("keepMusicPlaying", s.keepMusicPlaying)
+            .putBoolean("mirrorFrontSave", s.mirrorFrontSave)
+            .putString("videoQuality", s.videoQuality.name)
+            .putString("videoAudioMode", s.videoAudioMode.name)
+            .putString("stabilizerMode", s.stabilizerMode.name)
+            .putBoolean("cinema180Shutter", s.cinema180Shutter)
+            .putString("dateStampStyle", s.dateStampStyle.name)
+            .putInt("astroDurationSec", s.astroDurationSec)
+            .putString("astroStyle", s.astroStyle.name)
+            .putBoolean("astroLightPollutionClean", s.astroLightPollutionClean)
+            .putBoolean("astroHotPixelClean", s.astroHotPixelClean)
+            .putString("doubleExpBlend", s.doubleExpBlend.name)
+            .putFloat("actionPanStrength", s.actionPanStrength)
+            .apply()
+    }
+
+    private fun playShutterSound() {
+        if (_uiState.value.settings.shutterSoundEnabled) {
+            runCatching { actionSound?.play(MediaActionSound.SHUTTER_CLICK) }
+        }
+    }
+
+    private fun playVideoStartSound() {
+        if (_uiState.value.settings.shutterSoundEnabled) {
+            runCatching { actionSound?.play(MediaActionSound.START_VIDEO_RECORDING) }
+        }
+    }
+
+    private fun playVideoStopSound() {
+        if (_uiState.value.settings.shutterSoundEnabled) {
+            runCatching { actionSound?.play(MediaActionSound.STOP_VIDEO_RECORDING) }
+        }
+    }
+
+    fun syncAudioMeter() {
+        val state = _uiState.value
+        val isVideoMode = state.settings.shootingMode == ShootingMode.VIDEO ||
+            state.settings.shootingMode == ShootingMode.SLOW_MO ||
+            state.settings.shootingMode == ShootingMode.CINEMATIC
+        val hasAudio = ContextCompat.checkSelfPermission(
+            getApplication(),
+            Manifest.permission.RECORD_AUDIO
+        ) == PackageManager.PERMISSION_GRANTED
+        if (state.settings.audioMeterEnabled && isVideoMode && !state.isVideoRecording && !state.settings.micMuted) {
+            audioMeterController.start(hasAudio)
+        } else {
+            audioMeterController.stop()
         }
     }
 
@@ -221,6 +419,9 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         onPhotoCaptured = { photo ->
             viewModelScope.launch {
                 val thumb = photo.jpegUri?.let { loadScaledBitmap(it, 240) }
+                if (photo.filePath != null) {
+                    pendingLivePhotoName = photo.filePath
+                }
                 _uiState.update {
                     it.copy(
                         lastCapturedPhoto = photo,
@@ -282,6 +483,7 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
 
     fun resumeCameraIfNeeded() {
         syncHandsFreeControllers()
+        syncAudioMeter()
         val surface = previewSurface ?: return
         if (!surface.isValid) return
         val lens = _uiState.value.activeLens ?: return
@@ -292,6 +494,8 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         dualCameraController.stopSecondary()
         handsFreeController.setVoiceEnabled(false, false)
         handsFreeController.setPalmEnabled(false)
+        audioMeterController.stop()
+        videoMeterJob?.cancel()
         cameraEngine.stop()
     }
 
@@ -299,6 +503,13 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         super.onCleared()
         dualCameraController.release()
         handsFreeController.release()
+        viewfinderScanner.release()
+        livePhotoController.clearBuffer()
+        audioMeterController.stop()
+        videoMeterJob?.cancel()
+        astroJob?.cancel()
+        runCatching { actionSound?.release() }
+        _uiState.value.doubleExpFirstShot?.recycle()
         cameraEngine.stop()
     }
 
@@ -347,24 +558,38 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         if (_uiState.value.isVideoRecording) stopVideoRecording()
         if (_uiState.value.timeLapseState.isRunning) stopTimeLapse()
         if (_uiState.value.panoramaState.isCapturing) cancelPanorama()
+        if (_uiState.value.isAstroCapturing) cancelAstroCapture()
         if (mode != ShootingMode.DUAL) {
             dualCameraController.stopSecondary()
             _uiState.update { it.copy(isDualConcurrentLive = false) }
+        }
+        if (mode != ShootingMode.DOUBLE_EXP && _uiState.value.doubleExpFirstShot != null) {
+            _uiState.value.doubleExpFirstShot?.recycle()
+            _uiState.update { it.copy(doubleExpFirstShot = null) }
         }
 
         updateSettings { s ->
             when (mode) {
                 ShootingMode.SUPER_MACRO -> s.copy(
                     shootingMode = mode,
-                    focusPeaking = true
+                    focusPeaking = true,
+                    astroRedUiEnabled = false
+                )
+                ShootingMode.ASTRO -> s.copy(
+                    shootingMode = mode,
+                    focusDistanceDiopters = 0f, // Auto-lock focus to Infinity (∞) for sharp stars!
+                    focusPeaking = false
                 )
                 else -> s.copy(
                     shootingMode = mode,
                     focusDistanceDiopters = null,
-                    focusPeaking = if (s.shootingMode == ShootingMode.SUPER_MACRO) false else s.focusPeaking
+                    focusPeaking = if (s.shootingMode == ShootingMode.SUPER_MACRO) false else s.focusPeaking,
+                    astroRedUiEnabled = false,
+                    astroStarLoupeEnabled = false
                 )
             }
         }
+        syncAudioMeter()
     }
 
     fun cycleTimerDuration() {
@@ -505,7 +730,29 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
                     captureDualReactionPhoto()
                 }
             }
-            ShootingMode.VIDEO, ShootingMode.SLOW_MO -> {
+            ShootingMode.PORTRAIT -> {
+                if (!state.isPortraitProcessing) {
+                    capturePortraitBokehPhoto()
+                }
+            }
+            ShootingMode.ASTRO -> {
+                if (state.isAstroCapturing) {
+                    cancelAstroCapture()
+                } else {
+                    captureAstroSkyStack()
+                }
+            }
+            ShootingMode.DOUBLE_EXP -> {
+                if (!state.isProcessingDoubleExp) {
+                    captureDoubleExposureStep()
+                }
+            }
+            ShootingMode.ACTION_PAN -> {
+                if (!state.isActionPanProcessing) {
+                    captureActionPanPhoto()
+                }
+            }
+            ShootingMode.VIDEO, ShootingMode.SLOW_MO, ShootingMode.CINEMATIC -> {
                 if (state.isVideoRecording) {
                     stopVideoRecording()
                 } else {
@@ -585,13 +832,19 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
                             delay(1000)
                         }
                         _uiState.update { it.copy(countdownRemainingSec = 0) }
-                        for (shot in 1..burstCount) {
-                            capturePhoto()
-                            if (shot < burstCount) {
-                                delay(650)
+                        if (state.settings.nightModeDuration.seconds > 0 && burstCount == 1) {
+                            captureNightModeStack()
+                        } else {
+                            for (shot in 1..burstCount) {
+                                capturePhoto()
+                                if (shot < burstCount) {
+                                    delay(650)
+                                }
                             }
                         }
                     }
+                } else if (state.settings.nightModeDuration.seconds > 0) {
+                    captureNightModeStack()
                 } else {
                     capturePhoto()
                 }
@@ -600,6 +853,7 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     private fun startVideoRecording(isSlowMo: Boolean) {
+        audioMeterController.stop()
         val hasAudio = ContextCompat.checkSelfPermission(
             getApplication(),
             Manifest.permission.RECORD_AUDIO
@@ -609,41 +863,128 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
             settings = _uiState.value.settings,
             hasAudioPermission = hasAudio,
             onStarted = { fpsLabel ->
+                playVideoStartSound()
                 _uiState.update {
-                    it.copy(isVideoRecording = true, videoElapsedSec = 0, videoFpsBadge = fpsLabel)
+                    it.copy(isVideoRecording = true, isVideoPaused = false, videoElapsedSec = 0, videoFpsBadge = fpsLabel)
                 }
                 videoTimerJob?.cancel()
                 videoTimerJob = viewModelScope.launch {
                     var s = 0
                     while (_uiState.value.isVideoRecording) {
                         delay(1000)
-                        s++
-                        _uiState.update { it.copy(videoElapsedSec = s) }
+                        if (!_uiState.value.isVideoPaused) {
+                            s++
+                            _uiState.update { it.copy(videoElapsedSec = s) }
+                        }
+                    }
+                }
+                videoMeterJob?.cancel()
+                videoMeterJob = viewModelScope.launch {
+                    var smoothed = 0f
+                    while (_uiState.value.isVideoRecording) {
+                        val st = _uiState.value
+                        if (st.settings.audioMeterEnabled && !st.isVideoPaused && !st.settings.micMuted) {
+                            val amp = cameraEngine.getRecordingMaxAmplitude()
+                            val norm = if (amp > 0) {
+                                val db = (20.0 * kotlin.math.log10((amp / 32767.0).coerceAtLeast(1e-4))).toFloat().coerceIn(-60f, 0f)
+                                val raw = ((db + 54f) / 54f).coerceIn(0f, 1f)
+                                smoothed = smoothed * 0.4f + raw * 0.6f
+                                _uiState.update { it.copy(audioLevel01 = smoothed, audioPeakDb = db) }
+                                smoothed
+                            } else {
+                                smoothed *= 0.7f
+                                _uiState.update { it.copy(audioLevel01 = smoothed, audioPeakDb = -60f) }
+                                smoothed
+                            }
+                            @Suppress("UNUSED_EXPRESSION") norm
+                        }
+                        delay(75)
                     }
                 }
             },
-            onFailed = { msg -> showBanner(msg) }
+            onFailed = { msg ->
+                syncAudioMeter()
+                showBanner(msg)
+            }
         )
+    }
+
+    fun togglePauseVideoRecording() {
+        val state = _uiState.value
+        if (!state.isVideoRecording) return
+        if (state.isVideoPaused) {
+            if (cameraEngine.resumeVideoRecording()) {
+                _uiState.update { it.copy(isVideoPaused = false) }
+                showBanner("Recording resumed")
+            }
+        } else {
+            if (cameraEngine.pauseVideoRecording()) {
+                _uiState.update { it.copy(isVideoPaused = true) }
+                showBanner("Recording paused")
+            }
+        }
+    }
+
+    fun captureMidVideoSnapshot() {
+        val state = _uiState.value
+        if (!state.isVideoRecording) return
+        playShutterSound()
+        viewModelScope.launch {
+            _uiState.update { it.copy(showShutterFlash = true) }
+            cameraEngine.captureVideoSnapshot(state.grade, state.settings, state.activeLut)
+            delay(110)
+            _uiState.update { it.copy(showShutterFlash = false) }
+        }
     }
 
     private fun stopVideoRecording() {
         val elapsed = _uiState.value.videoElapsedSec
+        val vhsRetroActive = _uiState.value.grade.vhsRetro > 0.01f
         videoTimerJob?.cancel()
         videoTimerJob = null
+        videoMeterJob?.cancel()
+        videoMeterJob = null
         cameraEngine.stopVideoRecording { uri ->
-            _uiState.update { it.copy(isVideoRecording = false, videoElapsedSec = 0) }
+            playVideoStopSound()
+            _uiState.update {
+                it.copy(
+                    isVideoRecording = false,
+                    isVideoPaused = false,
+                    videoElapsedSec = 0,
+                    audioLevel01 = 0f,
+                    audioPeakDb = -60f
+                )
+            }
+            syncAudioMeter()
             if (uri != null) {
                 viewModelScope.launch {
-                    // Brief settle delay so MediaStore finalizes video metadata before thumbnail load
                     delay(180)
-                    val thumb = loadMediaThumbnail(getApplication(), uri, isVideo = true, maxDim = 240)
-                    if (thumb != null) {
-                        _uiState.update { it.copy(lastThumbnail = thumb, lastThumbnailIsVideo = true) }
+                    if (vhsRetroActive) {
+                        _uiState.update { it.copy(isBakingVhs = true) }
+                        showBanner("Baking 90s VHS tape look...")
+                        val vhsUri = com.truelens.camera.modes.VideoTrimExporter.bakeVhsLookToMp4(
+                            context = getApplication(),
+                            sourceUri = uri
+                        )
+                        _uiState.update { it.copy(isBakingVhs = false) }
+                        val finalUri = vhsUri ?: uri
+                        val thumb = loadMediaThumbnail(getApplication(), finalUri, isVideo = true, maxDim = 240)
+                        if (thumb != null) {
+                            _uiState.update { it.copy(lastThumbnail = thumb, lastThumbnailIsVideo = true) }
+                        } else {
+                            refreshLatestThumbnail()
+                        }
+                        showBanner(if (vhsUri != null) "Saved VHS '94 MP4 to Movies/TrueLens" else "Saved MP4 to Movies/TrueLens")
                     } else {
-                        refreshLatestThumbnail()
+                        val thumb = loadMediaThumbnail(getApplication(), uri, isVideo = true, maxDim = 240)
+                        if (thumb != null) {
+                            _uiState.update { it.copy(lastThumbnail = thumb, lastThumbnailIsVideo = true) }
+                        } else {
+                            refreshLatestThumbnail()
+                        }
+                        showBanner("Saved MP4 to Movies/TrueLens")
                     }
                 }
-                showBanner("Saved MP4 to Movies/TrueLens")
             } else {
                 showBanner(if (elapsed < 1) "Record at least 1 second to save video" else "Video save failed")
             }
@@ -653,6 +994,7 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
     private fun scanDocumentNow() {
         if (_uiState.value.isScanningDocument) return
         val style = _uiState.value.settings.scanStyle
+        playShutterSound()
         _uiState.update { it.copy(isScanningDocument = true, showShutterFlash = true) }
         cameraEngine.capturePanoramaFrame(_uiState.value.settings) { bmp ->
             viewModelScope.launch {
@@ -726,6 +1068,21 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         _uiState.update { it.copy(longExposureState = it.longExposureState.copy(style = style)) }
     }
 
+    fun onGyroAngularSpeed(radPerSec: Float) {
+        latestGyroMag = latestGyroMag * 0.45f + radPerSec * 0.55f
+        if (radPerSec > peakGyroDuringCapture) {
+            peakGyroDuringCapture = radPerSec
+        }
+        val now = System.currentTimeMillis()
+        if (now - lastGyroUiUpdateMs >= 140L) {
+            lastGyroUiUpdateMs = now
+            val steady = latestGyroMag < 0.08f
+            if (_uiState.value.isPhoneSteady != steady) {
+                _uiState.update { it.copy(isPhoneSteady = steady) }
+            }
+        }
+    }
+
     private fun startLongExposure() {
         val le = _uiState.value.longExposureState
         val totalFrames = (le.durationSec * 3).coerceIn(6, 36)
@@ -733,15 +1090,34 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
             _uiState.update {
                 it.copy(longExposureState = le.copy(isCapturing = true, progress = 0f, accumulatedFrames = 0))
             }
+            // Anti-shake tap-settle gate: wait briefly if user's tap vibrated the tripod/hands
+            if (latestGyroMag > 0.07f) {
+                showBanner("Settling tripod vibration...")
+                var waited = 0
+                while (latestGyroMag > 0.06f && waited < 1500) {
+                    delay(100)
+                    waited += 100
+                }
+            }
             val collected = mutableListOf<Bitmap>()
+            var droppedShaken = 0
             val delayPerFrameMs = (le.durationSec * 1000L) / totalFrames
             for (i in 1..totalFrames) {
+                peakGyroDuringCapture = 0f
                 val frame = kotlinx.coroutines.suspendCancellableCoroutine<Bitmap?> { cont ->
                     cameraEngine.capturePanoramaFrame(_uiState.value.settings) { bmp ->
                         if (cont.isActive) cont.resume(bmp) {}
                     }
                 }
-                if (frame != null) collected.add(frame)
+                if (frame != null) {
+                    // Reject sharp wind gusts / tripod bumps cleanly if we already have base frames
+                    if (peakGyroDuringCapture > 0.30f && collected.isNotEmpty()) {
+                        frame.recycle()
+                        droppedShaken++
+                    } else {
+                        collected.add(frame)
+                    }
+                }
                 _uiState.update {
                     it.copy(
                         longExposureState = it.longExposureState.copy(
@@ -764,10 +1140,375 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
             _uiState.update {
                 it.copy(
                     longExposureState = it.longExposureState.copy(isCapturing = false, progress = 0f),
-                    lastThumbnail = thumb ?: it.lastThumbnail
+                    lastThumbnail = thumb ?: it.lastThumbnail,
+                    lastThumbnailIsVideo = if (thumb != null) false else it.lastThumbnailIsVideo
                 )
             }
-            showBanner(if (uri != null) "Long Exposure (${le.durationSec}s ${le.style.label}) saved" else "Long Exposure failed")
+            val shakeNote = if (droppedShaken > 0) " • $droppedShaken shaken skipped" else ""
+            showBanner(if (uri != null) "Long Exposure (${le.durationSec}s ${le.style.label}$shakeNote) saved" else "Long Exposure failed")
+        }
+    }
+
+    // --- ASTROPHOTOGRAPHY / SKY MODE (15s-60s Optical Stacking + Tripod Anti-Shake + Sky Presets) ---
+
+    fun setAstroDuration(seconds: Int) {
+        updateSettings { it.copy(astroDurationSec = seconds.coerceIn(15, 60)) }
+    }
+
+    fun toggleAstroStyle() {
+        updateSettings { s ->
+            val next = if (s.astroStyle == AstroStyle.PINPOINT_STARS) AstroStyle.STAR_TRAILS else AstroStyle.PINPOINT_STARS
+            s.copy(astroStyle = next)
+        }
+        showBanner("Astro: ${_uiState.value.settings.astroStyle.label}")
+    }
+
+    fun toggleAstroRedUi() {
+        updateSettings { it.copy(astroRedUiEnabled = !it.astroRedUiEnabled) }
+        showBanner(if (_uiState.value.settings.astroRedUiEnabled) "Night-Vision Red UI ON" else "Standard UI")
+    }
+
+    fun toggleAstroStarLoupe() {
+        updateSettings { it.copy(astroStarLoupeEnabled = !it.astroStarLoupeEnabled) }
+        showBanner(if (_uiState.value.settings.astroStarLoupeEnabled) "4× Star Focus Magnifier ON" else "Star Magnifier OFF")
+    }
+
+    fun toggleAstroLightPollution() {
+        updateSettings { it.copy(astroLightPollutionClean = !it.astroLightPollutionClean) }
+        showBanner(if (_uiState.value.settings.astroLightPollutionClean) "Light-Pollution Gradient Cleaner ON" else "Raw Sky Gradient")
+    }
+
+    fun toggleAstroHotPixels() {
+        updateSettings { it.copy(astroHotPixelClean = !it.astroHotPixelClean) }
+        showBanner(if (_uiState.value.settings.astroHotPixelClean) "Hot-Pixel Removal ON" else "Hot-Pixel Removal OFF")
+    }
+
+    fun lockInfinityFocus() {
+        updateSettings { it.copy(focusDistanceDiopters = 0f) }
+        showBanner("Focus locked to Infinity (∞) for crisp stars")
+    }
+
+    fun applySkyPreset(preset: SkyPreset) {
+        when (preset) {
+            SkyPreset.MILKY_WAY -> {
+                updateSettings {
+                    it.copy(
+                        astroDurationSec = 30,
+                        astroStyle = AstroStyle.PINPOINT_STARS,
+                        astroLightPollutionClean = true,
+                        astroHotPixelClean = true,
+                        astroStarLoupeEnabled = false,
+                        focusDistanceDiopters = 0f,
+                        exposureMode = ExposureMode.AUTO_P,
+                        evCompensationSteps = 2
+                    )
+                }
+                showBanner("Milky Way: 30s Pinpoint • ∞ Focus • LP Clean ON")
+            }
+            SkyPreset.STAR_TRAILS -> {
+                updateSettings {
+                    it.copy(
+                        astroDurationSec = 60,
+                        astroStyle = AstroStyle.STAR_TRAILS,
+                        astroLightPollutionClean = false,
+                        astroHotPixelClean = true,
+                        astroStarLoupeEnabled = false,
+                        focusDistanceDiopters = 0f,
+                        exposureMode = ExposureMode.AUTO_P,
+                        evCompensationSteps = 1
+                    )
+                }
+                showBanner("Star Trails: 60s Lighten Stack • ∞ Focus")
+            }
+            SkyPreset.FULL_MOON -> {
+                updateSettings {
+                    it.copy(
+                        astroDurationSec = 15,
+                        astroStyle = AstroStyle.PINPOINT_STARS,
+                        astroLightPollutionClean = false,
+                        astroHotPixelClean = true,
+                        astroStarLoupeEnabled = true,
+                        focusDistanceDiopters = 0f,
+                        exposureMode = ExposureMode.AUTO_P,
+                        evCompensationSteps = -4
+                    )
+                }
+                showBanner("Full Moon: EV -4 • ∞ Focus • 4× Moon Loupe ON")
+            }
+            SkyPreset.SUNSET_SKY -> {
+                updateSettings {
+                    it.copy(
+                        astroDurationSec = 15,
+                        astroStyle = AstroStyle.PINPOINT_STARS,
+                        astroLightPollutionClean = false,
+                        astroHotPixelClean = false,
+                        astroStarLoupeEnabled = false,
+                        focusDistanceDiopters = 0f,
+                        exposureMode = ExposureMode.AUTO_P,
+                        evCompensationSteps = -3
+                    )
+                }
+                showBanner("Sunset Sky: EV -3 • Protects rich clouds & glow")
+            }
+        }
+    }
+
+    private fun cancelAstroCapture() {
+        astroJob?.cancel()
+        astroJob = null
+        _uiState.update {
+            it.copy(isAstroCapturing = false, astroPhaseLabel = "", astroProgress = 0f)
+        }
+        showBanner("Astro capture stopped")
+    }
+
+    private fun captureAstroSkyStack() {
+        if (_uiState.value.isAstroCapturing) return
+        val s = _uiState.value.settings
+        val durSec = s.astroDurationSec.coerceIn(15, 60)
+        // Bounded frame count (10..18) evenly paced over durSec so RAM stays light while stacking clean optical light
+        val totalFrames = when {
+            durSec <= 15 -> 10
+            durSec <= 30 -> 14
+            else -> 18
+        }
+        val collected = mutableListOf<Bitmap>()
+        astroJob?.cancel()
+        astroJob = viewModelScope.launch {
+            try {
+                _uiState.update {
+                    it.copy(
+                        isAstroCapturing = true,
+                        astroPhaseLabel = "Settling tripod vibration...",
+                        astroProgress = 0f,
+                        astroKeptFrames = 0,
+                        astroDroppedFrames = 0
+                    )
+                }
+                // Phase 1: Tap-Settle Stability Gate (wait up to 2.5s for finger tap vibration to die out)
+                var waitedMs = 0
+                delay(450)
+                while (latestGyroMag > 0.06f && waitedMs < 2500) {
+                    delay(120)
+                    waitedMs += 120
+                }
+
+                // Phase 2: Timed optical star-sky capture with live wind-shake rejection
+                var dropped = 0
+                val intervalMs = ((durSec * 1000L) / totalFrames).coerceAtLeast(350L)
+                for (i in 1..totalFrames) {
+                    _uiState.update {
+                        it.copy(
+                            astroPhaseLabel = "Capturing ${s.astroStyle.label} ($i/$totalFrames)...",
+                            astroProgress = (i - 1).toFloat() / totalFrames.toFloat()
+                        )
+                    }
+                    peakGyroDuringCapture = 0f
+                    val frame = captureSingleMemoryBitmap()
+                    if (frame != null) {
+                        if (peakGyroDuringCapture > 0.16f && collected.isNotEmpty()) {
+                            frame.recycle()
+                            dropped++
+                        } else {
+                            collected.add(frame)
+                        }
+                    }
+                    _uiState.update {
+                        it.copy(
+                            astroProgress = i.toFloat() / totalFrames.toFloat(),
+                            astroKeptFrames = collected.size,
+                            astroDroppedFrames = dropped
+                        )
+                    }
+                    if (i < totalFrames) {
+                        delay(intervalMs)
+                    }
+                }
+
+                // Phase 3: Align, clean hot pixels & light pollution, save!
+                _uiState.update { it.copy(astroPhaseLabel = "Aligning stars & cleaning sky...") }
+                val cur = _uiState.value
+                val uri = com.truelens.camera.modes.AstroSkyEngine.stackAstroAndSave(
+                    context = getApplication(),
+                    frames = collected,
+                    style = cur.settings.astroStyle,
+                    cleanLightPollution = cur.settings.astroLightPollutionClean,
+                    cleanHotPixels = cur.settings.astroHotPixelClean,
+                    grade = cur.grade,
+                    lut = cur.activeLut,
+                    dateStampStyle = cur.settings.dateStampStyle
+                )
+                val thumb = uri?.let { loadScaledBitmap(it, 240) }
+                _uiState.update {
+                    it.copy(
+                        isAstroCapturing = false,
+                        astroPhaseLabel = "",
+                        astroProgress = 0f,
+                        lastThumbnail = thumb ?: it.lastThumbnail,
+                        lastThumbnailIsVideo = if (thumb != null) false else it.lastThumbnailIsVideo
+                    )
+                }
+                val dropTxt = if (dropped > 0) " • $dropped shaken skipped" else ""
+                showBanner(if (uri != null) "Astro ${cur.settings.astroStyle.label} (${collected.size}f$dropTxt) saved" else "Astro capture failed")
+            } finally {
+                collected.forEach { if (!it.isRecycled) it.recycle() }
+                _uiState.update { it.copy(isAstroCapturing = false, astroPhaseLabel = "", astroProgress = 0f) }
+            }
+        }
+    }
+
+    // --- DOUBLE EXPOSURE MODE ---
+
+    fun setDoubleExpBlend(mode: DoubleExpBlendMode) {
+        updateSettings { it.copy(doubleExpBlend = mode) }
+    }
+
+    fun setDoubleExpWeight(weight: Float) {
+        _uiState.update { it.copy(doubleExpWeight = weight.coerceIn(0.15f, 0.85f)) }
+    }
+
+    fun retakeDoubleExposureFirst() {
+        _uiState.value.doubleExpFirstShot?.recycle()
+        _uiState.update { it.copy(doubleExpFirstShot = null) }
+        showBanner("Cleared Shot 1 — frame your first exposure")
+    }
+
+    private fun captureDoubleExposureStep() {
+        val state = _uiState.value
+        playShutterSound()
+        viewModelScope.launch {
+            _uiState.update { it.copy(isProcessingDoubleExp = true, showShutterFlash = true) }
+            delay(100)
+            _uiState.update { it.copy(showShutterFlash = false) }
+            val captured = captureSingleMemoryBitmap()
+            if (captured == null) {
+                _uiState.update { it.copy(isProcessingDoubleExp = false) }
+                showBanner("Capture unavailable")
+                return@launch
+            }
+            val first = _uiState.value.doubleExpFirstShot
+            if (first == null) {
+                _uiState.update {
+                    it.copy(doubleExpFirstShot = captured, isProcessingDoubleExp = false)
+                }
+                showBanner("Shot 1 locked • Frame Shot 2 & tap shutter to blend")
+            } else {
+                val cur = _uiState.value
+                val uri = com.truelens.camera.modes.DoubleExposureEngine.blendAndSave(
+                    context = getApplication(),
+                    shot1 = first,
+                    shot2 = captured,
+                    blendMode = cur.settings.doubleExpBlend,
+                    weightSecond = cur.doubleExpWeight,
+                    grade = cur.grade,
+                    lut = cur.activeLut,
+                    dateStampStyle = cur.settings.dateStampStyle
+                )
+                first.recycle()
+                captured.recycle()
+                val thumb = uri?.let { loadScaledBitmap(it, 240) }
+                _uiState.update {
+                    it.copy(
+                        doubleExpFirstShot = null,
+                        isProcessingDoubleExp = false,
+                        lastThumbnail = thumb ?: it.lastThumbnail,
+                        lastThumbnailIsVideo = if (thumb != null) false else it.lastThumbnailIsVideo
+                    )
+                }
+                showBanner(if (uri != null) "Double Exposure (${cur.settings.doubleExpBlend.label}) saved" else "Double Exposure failed")
+            }
+        }
+    }
+
+    // --- QUICK MOTION / ACTION PAN MODE ---
+
+    fun setActionPanStrength(strength: Float) {
+        updateSettings { it.copy(actionPanStrength = strength.coerceIn(0.2f, 1.0f)) }
+    }
+
+    private fun captureActionPanPhoto() {
+        val state = _uiState.value
+        playShutterSound()
+        viewModelScope.launch {
+            _uiState.update { it.copy(isActionPanProcessing = true, showShutterFlash = true) }
+            delay(100)
+            _uiState.update { it.copy(showShutterFlash = false) }
+            val frame = captureSingleMemoryBitmap()
+            if (frame != null) {
+                val uri = com.truelens.camera.modes.ActionPanEngine.renderAndSaveActionPan(
+                    context = getApplication(),
+                    source = frame,
+                    streakStrength = state.settings.actionPanStrength,
+                    grade = state.grade,
+                    lut = state.activeLut,
+                    dateStampStyle = state.settings.dateStampStyle
+                )
+                frame.recycle()
+                val thumb = uri?.let { loadScaledBitmap(it, 240) }
+                _uiState.update {
+                    it.copy(
+                        isActionPanProcessing = false,
+                        lastThumbnail = thumb ?: it.lastThumbnail,
+                        lastThumbnailIsVideo = if (thumb != null) false else it.lastThumbnailIsVideo
+                    )
+                }
+                showBanner(if (uri != null) "Action Pan motion photo saved" else "Action Pan failed")
+            } else {
+                _uiState.update { it.copy(isActionPanProcessing = false) }
+                showBanner("Action Pan unavailable")
+            }
+        }
+    }
+
+    // --- NEW TOGGLES (Shutter Sound, Audio dB Meter, Auto Night Prompt, Floating Shutter, Quick VHS) ---
+
+    fun toggleShutterSound() {
+        val next = !_uiState.value.settings.shutterSoundEnabled
+        updateSettings { it.copy(shutterSoundEnabled = next) }
+        showBanner(if (next) "Shutter Sound ON" else "Silent Shutter ON")
+    }
+
+    fun toggleAudioMeter() {
+        val next = !_uiState.value.settings.audioMeterEnabled
+        updateSettings { it.copy(audioMeterEnabled = next) }
+        syncAudioMeter()
+        showBanner(if (next) "Live Audio dB Meter ON" else "Audio dB Meter OFF")
+    }
+
+    fun toggleAutoNightPrompt() {
+        val next = !_uiState.value.settings.autoNightPromptEnabled
+        updateSettings { it.copy(autoNightPromptEnabled = next) }
+        showBanner(if (next) "Auto Night Indicator ON" else "Auto Night Indicator OFF")
+    }
+
+    fun toggleFloatingShutter() {
+        val next = !_uiState.value.settings.floatingShutterEnabled
+        updateSettings { it.copy(floatingShutterEnabled = next) }
+        showBanner(if (next) "Floating Shutter ON (Hold & drag to move)" else "Floating Shutter OFF")
+    }
+
+    fun updateFloatingShutterPos(normX: Float, normY: Float) {
+        val cx = normX.coerceIn(0.08f, 0.92f)
+        val cy = normY.coerceIn(0.12f, 0.88f)
+        _uiState.update { it.copy(floatingShutterX = cx, floatingShutterY = cy) }
+        appPrefs.edit().putFloat("floatingShutterX", cx).putFloat("floatingShutterY", cy).apply()
+    }
+
+    fun toggleVhsRetroQuick() {
+        val cur = _uiState.value.grade.vhsRetro
+        if (cur > 0.01f) {
+            _uiState.update {
+                it.copy(grade = it.grade.copy(vhsRetro = 0f), activePresetId = "true_zero")
+            }
+            showBanner("VHS '94 Look OFF")
+        } else {
+            val vhsPreset = BuiltInPresets.ALL.firstOrNull { it.id == "vhs_94" }
+            if (vhsPreset != null) {
+                applyPreset(vhsPreset)
+            } else {
+                updateGrade { it.copy(vhsRetro = 0.85f) }
+            }
+            showBanner("VHS '94 Camcorder Look ON (bakes into recorded video)")
         }
     }
 
@@ -1074,6 +1815,13 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
             val exif = withContext(Dispatchers.IO) {
                 com.truelens.camera.grading.PhotoFrameRenderer.readExifSummary(getApplication(), uri)
             }
+            val liveFile = withContext(Dispatchers.IO) {
+                val displayName = resolveDisplayNameForUri(uri)
+                if (displayName != null) {
+                    val f = com.truelens.camera.modes.LivePhotoController.sidecarFileForName(getApplication(), displayName)
+                    if (f.exists() && f.length() > 1024L) f else null
+                } else null
+            }
             _uiState.update {
                 it.copy(
                     isGalleryOpen = false,
@@ -1088,9 +1836,52 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
                     darkroomFrameStyle = com.truelens.camera.grading.ExportFrameStyle.NONE,
                     darkroomDateStamp = com.truelens.camera.grading.DateStampStyle.OFF,
                     darkroomExif = exif,
+                    darkroomLiveVideoFile = liveFile,
                     canUndoDarkroom = false,
                     canRedoDarkroom = false
                 )
+            }
+        }
+    }
+
+    private fun resolveDisplayNameForUri(uri: Uri): String? {
+        return try {
+            getApplication<Application>().contentResolver.query(
+                uri,
+                arrayOf(MediaStore.MediaColumns.DISPLAY_NAME),
+                null,
+                null,
+                null
+            )?.use { c ->
+                if (c.moveToFirst()) c.getString(0) else null
+            }
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    fun saveDarkroomKeyPhoto(frame: Bitmap) {
+        viewModelScope.launch {
+            val savedUri = com.truelens.camera.modes.LivePhotoController.saveKeyPhotoFrame(getApplication(), frame)
+            if (savedUri != null) {
+                refreshLatestThumbnail()
+                showBanner("Saved Key Photo to Pictures/TrueLens")
+                openDarkroomForUri(savedUri)
+            } else {
+                showBanner("Could not save Key Photo")
+            }
+        }
+    }
+
+    fun exportDarkroomLiveVideo() {
+        val sidecar = _uiState.value.darkroomLiveVideoFile ?: return
+        viewModelScope.launch {
+            val savedUri = com.truelens.camera.modes.LivePhotoController.exportSidecarToMovies(getApplication(), sidecar)
+            if (savedUri != null) {
+                refreshLatestThumbnail()
+                showBanner("Saved Live Photo video to Movies/TrueLens")
+            } else {
+                showBanner("Could not export Live Photo video")
             }
         }
     }
@@ -1184,6 +1975,7 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         if (_uiState.value.settings.aeAfLocked) {
             updateSettings { it.copy(aeAfLocked = false) }
         }
+        _uiState.update { it.copy(rackFocusNormX = normX.coerceIn(0.05f, 0.95f), rackFocusNormY = normY.coerceIn(0.05f, 0.95f)) }
         cameraEngine.triggerTapToFocus(normX, normY)
     }
 
@@ -1221,7 +2013,8 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
             minEvSteps = lens.aeCompensationRange.lower,
             maxEvSteps = lens.aeCompensationRange.upper
         )
-        _uiState.update { it.copy(lightAnalysis = analysis) }
+        val isDark = latestAmbientLux < 18f || analysis.scene == com.truelens.camera.camera.LightingScene.LOW_LIGHT
+        _uiState.update { it.copy(lightAnalysis = analysis, isDarkLowLightScene = isDark) }
 
         val now = System.currentTimeMillis()
         if (state.settings.trueLightAuto &&
@@ -1261,6 +2054,43 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         val next = (_uiState.value.zoomRatio * zoomFactorDelta).coerceIn(minZ, maxZ)
         _uiState.update { it.copy(zoomRatio = next) }
         cameraEngine.setZoom(next)
+    }
+
+    /** Exact zoom setter for the Smooth Zoom Wheel / Dial (e.g., 1.3x, 2.4x, 5.2x). */
+    fun setExactZoom(targetZoom: Float) {
+        val state = _uiState.value
+        val rearLenses = state.lenses.filter { !it.isFront }
+        val active = state.activeLens ?: return
+        if (active.isFront) {
+            val z = targetZoom.coerceIn(active.minZoomRatio, active.maxZoomRatio)
+            _uiState.update { it.copy(zoomRatio = z) }
+            cameraEngine.setZoom(z)
+            return
+        }
+        val mainLens = rearLenses.firstOrNull { it.displayLabel == "1x" } ?: rearLenses.firstOrNull() ?: active
+        val ultraLens = rearLenses.firstOrNull { it.displayLabel.startsWith("0.") }
+        if (targetZoom < 0.92f && ultraLens != null) {
+            if (active.cameraId != ultraLens.cameraId) selectLens(ultraLens)
+            val z = (targetZoom / 0.6f).coerceIn(ultraLens.minZoomRatio, ultraLens.maxZoomRatio)
+            _uiState.update { it.copy(zoomRatio = z) }
+            cameraEngine.setZoom(z)
+        } else {
+            if (active.cameraId != mainLens.cameraId) selectLens(mainLens)
+            val z = targetZoom.coerceIn(mainLens.minZoomRatio, mainLens.maxZoomRatio)
+            _uiState.update { it.copy(zoomRatio = z) }
+            cameraEngine.setZoom(z)
+        }
+    }
+
+    /** Swipe Left (-1) or Right (+1) across viewfinder/bottom bar to smoothly switch primary modes. */
+    fun swipePrimaryMode(delta: Int) {
+        val modes = listOf(ShootingMode.PHOTO, ShootingMode.VIDEO, ShootingMode.PORTRAIT, ShootingMode.DUAL)
+        val cur = _uiState.value.settings.shootingMode
+        val idx = modes.indexOf(cur).let { if (it < 0) 0 else it }
+        val nextIdx = (idx + delta).coerceIn(0, modes.lastIndex)
+        if (nextIdx != idx || cur !in modes) {
+            setShootingMode(modes[nextIdx])
+        }
     }
 
     /**
@@ -1319,8 +2149,210 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     fun toggleMicMuted() {
-        updateSettings { it.copy(micMuted = !it.micMuted) }
-        showBanner(if (_uiState.value.settings.micMuted) "Video Mic Muted" else "Video Mic On")
+        cycleVideoAudioMode()
+    }
+
+    fun cycleVideoAudioMode() {
+        val entries = com.truelens.camera.camera.VideoAudioMode.entries
+        updateSettings { s ->
+            val next = entries[(entries.indexOf(s.videoAudioMode) + 1) % entries.size]
+            s.copy(videoAudioMode = next, micMuted = next == com.truelens.camera.camera.VideoAudioMode.MUTED)
+        }
+        syncAudioMeter()
+        val m = _uiState.value.settings.videoAudioMode
+        showBanner(
+            when (m) {
+                com.truelens.camera.camera.VideoAudioMode.STEREO -> "Audio: Stereo Mic (48kHz)"
+                com.truelens.camera.camera.VideoAudioMode.WIND_CUT -> "Audio: Wind & Noise Cut"
+                com.truelens.camera.camera.VideoAudioMode.MUTED -> "Audio: Muted"
+            }
+        )
+    }
+
+    fun toggleVideoWbLock() {
+        updateSettings { it.copy(videoWbLocked = !it.videoWbLocked) }
+        showBanner(if (_uiState.value.settings.videoWbLocked) "Video WB Locked (No Color Shift)" else "Video WB Auto")
+    }
+
+    fun toggleKeepMusicPlaying() {
+        updateSettings { it.copy(keepMusicPlaying = !it.keepMusicPlaying) }
+        showBanner(
+            if (_uiState.value.settings.keepMusicPlaying) "Music Stays Playing While Filming"
+            else "Pause Music While Filming"
+        )
+    }
+
+    fun toggleEnhanceMode() {
+        updateSettings { s ->
+            val next = if (s.enhanceMode == com.truelens.camera.camera.EnhanceMode.OFF) {
+                com.truelens.camera.camera.EnhanceMode.CLEAN
+            } else {
+                com.truelens.camera.camera.EnhanceMode.OFF
+            }
+            s.copy(enhanceMode = next)
+        }
+        val on = _uiState.value.settings.enhanceMode == com.truelens.camera.camera.EnhanceMode.CLEAN
+        showBanner(if (on) "Clean Enhance ON (Subtle Denoise & Crispness)" else "Pure Zero-AI Optics (Default)")
+    }
+
+    fun toggleQrScanner() {
+        val next = !_uiState.value.settings.qrScannerEnabled
+        updateSettings { it.copy(qrScannerEnabled = next) }
+        if (!next) _uiState.update { it.copy(detectedQr = null, stickyQr = null) }
+        showBanner(if (next) "Auto QR Scanner ON" else "Auto QR Scanner OFF")
+    }
+
+    fun toggleLiveText() {
+        val next = !_uiState.value.settings.liveTextEnabled
+        updateSettings { it.copy(liveTextEnabled = next) }
+        if (!next) _uiState.update { it.copy(detectedLiveText = null, isLiveTextSheetOpen = false) }
+        showBanner(if (next) "Live Text ON" else "Live Text OFF")
+    }
+
+    fun toggleLivePhoto() {
+        val next = !_uiState.value.settings.livePhotoEnabled
+        livePhotoController.isEnabled = next
+        if (!next) livePhotoController.clearBuffer()
+        updateSettings { it.copy(livePhotoEnabled = next) }
+        showBanner(if (next) "Live Photos ON (1.5s Before & After)" else "Live Photos OFF")
+    }
+
+    fun cycleNightModeDuration() {
+        val entries = com.truelens.camera.camera.NightModeDuration.entries
+        updateSettings { s ->
+            val next = entries[(entries.indexOf(s.nightModeDuration) + 1) % entries.size]
+            s.copy(nightModeDuration = next)
+        }
+        val d = _uiState.value.settings.nightModeDuration
+        showBanner(if (d.seconds == 0) "Night Stack OFF" else "Optical Night Stack: ${d.label} (Hold Steady)")
+    }
+
+    fun setPortraitAperture(fStop: Float) {
+        updateSettings { it.copy(portraitApertureF = fStop.coerceIn(1.4f, 16.0f)) }
+    }
+
+    fun dismissQr() {
+        stickyQrClearJob?.cancel()
+        _uiState.update { it.copy(detectedQr = null, stickyQr = null) }
+    }
+
+    fun openLiveTextSheet() {
+        if (_uiState.value.detectedLiveText != null) {
+            _uiState.update { it.copy(isLiveTextSheetOpen = true) }
+        }
+    }
+
+    fun closeLiveTextSheet() {
+        _uiState.update { it.copy(isLiveTextSheetOpen = false) }
+    }
+
+    fun onScannerPreviewSample(bitmap: Bitmap) {
+        val state = _uiState.value
+        val allowScan = state.settings.shootingMode == ShootingMode.PHOTO &&
+            !state.isVideoRecording &&
+            !state.isGalleryOpen &&
+            !state.isDarkroomOpen &&
+            !state.isPoseInsposOpen &&
+            !state.isLiveTextSheetOpen
+        if (!allowScan) {
+            bitmap.recycle()
+            return
+        }
+        viewfinderScanner.analyzeFrame(
+            bitmap = bitmap,
+            scanQr = state.settings.qrScannerEnabled,
+            scanText = state.settings.liveTextEnabled
+        )
+    }
+
+    fun onLivePhotoPreviewSample(bitmap: Bitmap) {
+        val state = _uiState.value
+        val active = state.settings.livePhotoEnabled &&
+            (state.settings.shootingMode == ShootingMode.PHOTO || state.settings.shootingMode == ShootingMode.PORTRAIT) &&
+            !state.isGalleryOpen &&
+            !state.isDarkroomOpen &&
+            !state.isPoseInsposOpen
+        livePhotoController.isEnabled = active
+        if (!active) {
+            bitmap.recycle()
+            return
+        }
+        livePhotoController.pushPreviewFrame(bitmap)
+    }
+
+    private fun captureNightModeStack() {
+        if (_uiState.value.isNightStacking) return
+        val durSec = _uiState.value.settings.nightModeDuration.seconds.coerceIn(1, 3)
+        val totalFrames = (durSec * 3).coerceIn(4, 9)
+        viewModelScope.launch {
+            _uiState.update { it.copy(isNightStacking = true, nightStackProgress = 0f) }
+            showBanner("Optical Night Stack (${durSec}s) — hold steady...")
+            val collected = mutableListOf<Bitmap>()
+            val delayPerFrameMs = (durSec * 1000L) / totalFrames
+            for (i in 1..totalFrames) {
+                val frame = captureSingleMemoryBitmap()
+                if (frame != null) collected.add(frame)
+                _uiState.update { it.copy(nightStackProgress = i.toFloat() / totalFrames.toFloat()) }
+                if (i < totalFrames) delay(delayPerFrameMs.coerceAtLeast(140L))
+            }
+            val s = _uiState.value
+            val uri = com.truelens.camera.modes.NightModeEngine.stackAndSave(
+                context = getApplication(),
+                frames = collected,
+                grade = s.grade,
+                lut = s.activeLut,
+                dateStampStyle = s.settings.dateStampStyle
+            )
+            collected.forEach { it.recycle() }
+            val thumb = uri?.let { loadScaledBitmap(it, 240) }
+            _uiState.update {
+                it.copy(
+                    isNightStacking = false,
+                    nightStackProgress = 0f,
+                    lastThumbnail = thumb ?: it.lastThumbnail,
+                    lastThumbnailIsVideo = if (thumb != null) false else it.lastThumbnailIsVideo
+                )
+            }
+            showBanner(if (uri != null) "Night Stack (${durSec}s Pure Optical) saved" else "Night Stack failed")
+        }
+    }
+
+    private fun capturePortraitBokehPhoto() {
+        if (_uiState.value.isPortraitProcessing) return
+        val state = _uiState.value
+        playShutterSound()
+        viewModelScope.launch {
+            _uiState.update { it.copy(isPortraitProcessing = true, showShutterFlash = true) }
+            delay(100)
+            _uiState.update { it.copy(showShutterFlash = false) }
+            val rawFrame = captureSingleMemoryBitmap()
+            if (rawFrame != null) {
+                val uri = com.truelens.camera.modes.PortraitBokehEngine.renderAndSavePortrait(
+                    context = getApplication(),
+                    source = rawFrame,
+                    apertureF = state.settings.portraitApertureF,
+                    grade = state.grade,
+                    lut = state.activeLut,
+                    dateStampStyle = state.settings.dateStampStyle
+                )
+                rawFrame.recycle()
+                val thumb = uri?.let { loadScaledBitmap(it, 240) }
+                _uiState.update {
+                    it.copy(
+                        isPortraitProcessing = false,
+                        lastThumbnail = thumb ?: it.lastThumbnail,
+                        lastThumbnailIsVideo = if (thumb != null) false else it.lastThumbnailIsVideo
+                    )
+                }
+                showBanner(
+                    if (uri != null) String.format(Locale.US, "Portrait f/%.1f saved", state.settings.portraitApertureF)
+                    else "Portrait capture failed"
+                )
+            } else {
+                _uiState.update { it.copy(isPortraitProcessing = false) }
+                showBanner("Portrait capture unavailable")
+            }
+        }
     }
 
     fun toggleCinema180Shutter() {
@@ -1451,6 +2483,7 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         val frontLens = state.lenses.firstOrNull { it.isFront }
         if (rearLens == null) return
 
+        playShutterSound()
         viewModelScope.launch {
             _uiState.update { it.copy(isCapturingDual = true, showShutterFlash = true) }
             delay(90)
@@ -1553,9 +2586,34 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
 
     fun capturePhoto() {
         val state = _uiState.value
+        playShutterSound()
         val useScreenFlash = state.activeLens?.isFront == true &&
             (state.settings.flashMode == com.truelens.camera.camera.FlashMode.ON ||
                 (state.settings.flashMode == com.truelens.camera.camera.FlashMode.AUTO && latestAmbientLux < 60f))
+        val captureLive = state.settings.livePhotoEnabled && state.settings.shootingMode == ShootingMode.PHOTO
+        if (captureLive) {
+            pendingLivePhotoName = null
+            livePhotoController.triggerCaptureSequence { frames ->
+                viewModelScope.launch {
+                    // Wait briefly for the hero JPEG filename to arrive from Camera2
+                    var targetName: String? = null
+                    repeat(25) {
+                        targetName = pendingLivePhotoName
+                        if (targetName != null) return@repeat
+                        delay(80)
+                    }
+                    val finalName = targetName ?: return@launch
+                    val outFile = com.truelens.camera.modes.LivePhotoController.sidecarFileForName(
+                        getApplication(),
+                        finalName
+                    )
+                    val ok = livePhotoController.encodeSidecarMp4(frames, outFile)
+                    if (ok) {
+                        showBanner("LIVE moment captured (3s)")
+                    }
+                }
+            }
+        }
         viewModelScope.launch {
             if (useScreenFlash) {
                 _uiState.update { it.copy(showFrontScreenFlash = true) }
@@ -1827,6 +2885,7 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
     private fun updateSettings(transform: (ManualSettings) -> ManualSettings) {
         val updated = transform(_uiState.value.settings)
         _uiState.update { it.copy(settings = updated) }
+        savePersistedSettings(updated)
         cameraEngine.updateSettings(updated, _uiState.value.grade)
     }
 

@@ -124,4 +124,86 @@ class TrueLensEnginesTest {
         val fallback = com.truelens.camera.grading.PhotoExifSummary()
         assertTrue(fallback.formattedSpecLine().contains("True Optics"))
     }
+
+    @Test
+    fun `ViewfinderScannerController parses QR URL, WiFi, Phone, and Live Text cleanly`() {
+        val urlQr = com.truelens.camera.modes.ViewfinderScannerController.parseQrPayload(
+            rawValue = "https://www.github.com/KTihana/TrueLens",
+            valueType = 8, // TYPE_URL
+            normalizedBox = null
+        )
+        assertEquals(com.truelens.camera.modes.QrActionType.URL, urlQr.actionType)
+
+        val wifiQr = com.truelens.camera.modes.ViewfinderScannerController.parseQrPayload(
+            rawValue = "WIFI:T:WPA;S:CafeGuest;P:secret123;;",
+            valueType = 9, // TYPE_WIFI
+            normalizedBox = null
+        )
+        assertEquals(com.truelens.camera.modes.QrActionType.WIFI, wifiQr.actionType)
+        assertEquals("CafeGuest", wifiQr.wifiSsid)
+        assertEquals("secret123", wifiQr.wifiPassword)
+
+        val liveText = com.truelens.camera.modes.ViewfinderScannerController.extractLiveTextInfo(
+            "Visit https://example.com or email hi@example.com\nCall +1 555-234-5678"
+        )
+        assertEquals("https://example.com", liveText?.firstUrl)
+        assertEquals("hi@example.com", liveText?.firstEmail)
+        assertTrue(liveText?.firstPhone?.contains("555") == true)
+    }
+
+    @Test
+    fun `PortraitBokehEngine scales optical blur inversely with f-stop aperture`() {
+        val wideOpen = com.truelens.camera.modes.PortraitBokehEngine.apertureToBlurRadius(1.4f)
+        val medium = com.truelens.camera.modes.PortraitBokehEngine.apertureToBlurRadius(4.0f)
+        val stoppedDown = com.truelens.camera.modes.PortraitBokehEngine.apertureToBlurRadius(16.0f)
+        assertTrue(wideOpen > medium)
+        assertTrue(medium > stoppedDown)
+    }
+
+    @Test
+    fun `AstroSkyEngine removes isolated hot pixels and reduces orange light pollution while keeping stars`() {
+        val w = 32
+        val h = 32
+        val darkSky = (0xFF shl 24) or (60 shl 16) or (40 shl 8) or 30
+        val px = IntArray(w * h) { darkSky }
+        // Inject a 1-pixel stuck hot red pixel at (10, 10)
+        val hotIdx = 10 * w + 10
+        px[hotIdx] = (0xFF shl 24) or (255 shl 16) or (20 shl 8) or 20
+        com.truelens.camera.modes.AstroSkyEngine.removeHotPixelsInPlace(px, w, h)
+        val fixedR = (px[hotIdx] shr 16) and 0xFF
+        assertTrue("Expected isolated hot pixel red spike to be cleaned (got $fixedR)", fixedR < 100)
+
+        // Inject a 2x2 real bright star at (20, 20) and run light pollution gradient cleaner
+        val star = (0xFF shl 24) or (250 shl 16) or (250 shl 8) or 255
+        px[20 * w + 20] = star
+        px[20 * w + 21] = star
+        px[21 * w + 20] = star
+        px[21 * w + 21] = star
+        com.truelens.camera.modes.AstroSkyEngine.subtractLightPollutionGradientInPlace(px, w, h)
+        val skyAfterR = (px[5 * w + 5] shr 16) and 0xFF
+        val starAfterR = (px[20 * w + 20] shr 16) and 0xFF
+        assertTrue("Sky orange glow should darken (was 60, now $skyAfterR)", skyAfterR < 50)
+        assertTrue("Real star should remain bright (now $starAfterR)", starAfterR > 200)
+    }
+
+    @Test
+    fun `Light leaks, halation, VHS are OFF by default and true 24fps cinema presets exist`() {
+        val neutral = LightroomGrade.NEUTRAL
+        assertTrue(neutral.isNeutral)
+        assertEquals(0f, neutral.halation, 0.0001f)
+        assertEquals(0, neutral.lightLeakStyle)
+        assertEquals(0f, neutral.vhsRetro, 0.0001f)
+
+        assertFalse(LightroomGrade(halation = 0.5f).isNeutral)
+        assertFalse(LightroomGrade(lightLeakStyle = 2, lightLeakIntensity = 0.6f).isNeutral)
+        assertFalse(LightroomGrade(vhsRetro = 0.8f).isNeutral)
+
+        val leakStylesInPresets = BuiltInPresets.ALL.map { it.grade.lightLeakStyle }.filter { it > 0 }.toSet()
+        assertTrue("Expected multiple distinct light leak styles in presets", leakStylesInPresets.size >= 4)
+        assertTrue(BuiltInPresets.ALL.any { it.grade.vhsRetro > 0.5f })
+
+        val qualities = com.truelens.camera.camera.VideoQuality.entries
+        assertTrue(qualities.any { it.targetFps == 24 && it.targetHeight == 1080 })
+        assertTrue(qualities.any { it.targetFps == 24 && it.targetHeight == 2160 })
+    }
 }
