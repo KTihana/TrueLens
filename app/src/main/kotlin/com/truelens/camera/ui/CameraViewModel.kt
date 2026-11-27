@@ -241,6 +241,7 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
     private var astroJob: Job? = null
     private var bannerJob: Job? = null
     private var darkroomPreviewJob: Job? = null
+    private var openedDarkroomFromGallery: Boolean = false
     private val canonSlotPrefs = application.getSharedPreferences("truelens_canon_slots", Context.MODE_PRIVATE)
     private val appPrefs = application.getSharedPreferences("truelens_prefs", Context.MODE_PRIVATE)
     private val actionSound: MediaActionSound? = runCatching {
@@ -272,6 +273,9 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         val grid = runCatching {
             GridOverlay.valueOf(appPrefs.getString("gridOverlay", GridOverlay.RULE_OF_THIRDS.name)!!)
         }.getOrDefault(GridOverlay.RULE_OF_THIRDS)
+        val capFmt = runCatching {
+            CaptureFormat.valueOf(appPrefs.getString("captureFormat", CaptureFormat.CLEAN_JPG.name)!!)
+        }.getOrDefault(CaptureFormat.CLEAN_JPG)
         val vq = runCatching {
             VideoQuality.valueOf(appPrefs.getString("videoQuality", VideoQuality.FHD_30.name)!!)
         }.getOrDefault(VideoQuality.FHD_30)
@@ -301,8 +305,9 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
                 floatingShutterX = appPrefs.getFloat("floatingShutterX", 0.80f).coerceIn(0.08f, 0.92f),
                 floatingShutterY = appPrefs.getFloat("floatingShutterY", 0.62f).coerceIn(0.12f, 0.88f),
                 settings = state.settings.copy(
+                    captureFormat = capFmt,
                     gridOverlay = grid,
-                    trueLightAuto = appPrefs.getBoolean("trueLightAuto", true),
+                    trueLightAuto = appPrefs.getBoolean("trueLightAuto", false),
                     autoNightPromptEnabled = appPrefs.getBoolean("autoNightPromptEnabled", true),
                     qrScannerEnabled = appPrefs.getBoolean("qrScannerEnabled", true),
                     liveTextEnabled = appPrefs.getBoolean("liveTextEnabled", true),
@@ -331,6 +336,7 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
 
     private fun savePersistedSettings(s: ManualSettings) {
         appPrefs.edit()
+            .putString("captureFormat", s.captureFormat.name)
             .putString("gridOverlay", s.gridOverlay.name)
             .putBoolean("trueLightAuto", s.trueLightAuto)
             .putBoolean("autoNightPromptEnabled", s.autoNightPromptEnabled)
@@ -446,18 +452,19 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
 
         engineInitialized = true
         _uiState.update { state ->
-            val defaultFormat = if (defaultLens?.supportsRawSensor == true) {
-                CaptureFormat.RAW_PLUS_JPG
+            // Default is CLEAN (1 crisp JPEG per shot). Preserve user's RAW choice only if lens supports RAW!
+            val resolvedFormat = if (defaultLens?.supportsRawSensor == true) {
+                state.settings.captureFormat
             } else {
                 CaptureFormat.CLEAN_JPG
             }
             state.copy(
                 lenses = lenses,
                 activeLens = defaultLens,
-                settings = state.settings.copy(captureFormat = defaultFormat),
+                settings = state.settings.copy(captureFormat = resolvedFormat),
                 telemetry = state.telemetry.copy(
                     aperture = defaultLens?.aperture ?: 1.8f,
-                    isRawActive = defaultLens?.supportsRawSensor == true
+                    isRawActive = defaultLens?.supportsRawSensor == true && resolvedFormat != CaptureFormat.CLEAN_JPG
                 )
             )
         }
@@ -1808,6 +1815,9 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     fun openDarkroomForUri(uri: Uri) {
+        if (_uiState.value.isGalleryOpen) {
+            openedDarkroomFromGallery = true
+        }
         darkroomUndoStack.clear()
         darkroomRedoStack.clear()
         viewModelScope.launch {
@@ -2491,9 +2501,11 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
 
             val origLens = _uiState.value.activeLens
             // Ensure primary capture comes from Rear camera (if user happened to flip to Front before entering Dual)
-            if (origLens?.isFront == true && previewSurface != null) {
-                openLens(rearLens, previewSurface!!)
-                delay(650)
+            if (origLens?.isFront == true) {
+                previewSurface?.takeIf { it.isValid }?.let { surf ->
+                    openLens(rearLens, surf)
+                    delay(650)
+                }
             }
             // Step 1: Capture primary Rear frame
             val backBmp = captureSingleMemoryBitmap()
@@ -2504,16 +2516,19 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
                 dualCameraController.grabLiveFrontBitmap(mirrorHorizontal = state.settings.mirrorFrontSave)
             } else null
 
-            if (frontBmp == null && frontLens != null && previewSurface != null) {
-                showBanner("Capturing reaction...")
-                openLens(frontLens, previewSurface!!)
-                delay(750)
-                frontBmp = captureSingleMemoryBitmap()
-                if (origLens != null && origLens.cameraId != frontLens.cameraId) {
-                    openLens(origLens, previewSurface!!)
+            if (frontBmp == null && frontLens != null) {
+                val frontSurf = previewSurface?.takeIf { it.isValid }
+                if (frontSurf != null) {
+                    showBanner("Capturing reaction...")
+                    openLens(frontLens, frontSurf)
+                    delay(750)
+                    frontBmp = captureSingleMemoryBitmap()
+                    if (origLens != null && origLens.cameraId != frontLens.cameraId) {
+                        previewSurface?.takeIf { it.isValid }?.let { openLens(origLens, it) }
+                    }
                 }
-            } else if (origLens != null && origLens.isFront && previewSurface != null) {
-                openLens(origLens, previewSurface!!)
+            } else if (origLens != null && origLens.isFront) {
+                previewSurface?.takeIf { it.isValid }?.let { openLens(origLens, it) }
             }
 
             if (backBmp != null) {
@@ -2766,7 +2781,8 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     fun closeDarkroom() {
-        _uiState.update { it.copy(isDarkroomOpen = false) }
+        openedDarkroomFromGallery = false
+        _uiState.update { it.copy(isDarkroomOpen = false, isGalleryOpen = true) }
     }
 
     fun updateDarkroomGrade(transform: (LightroomGrade) -> LightroomGrade) {

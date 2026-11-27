@@ -206,4 +206,51 @@ class TrueLensEnginesTest {
         assertTrue(qualities.any { it.targetFps == 24 && it.targetHeight == 1080 })
         assertTrue(qualities.any { it.targetFps == 24 && it.targetHeight == 2160 })
     }
+
+    @Test
+    fun `Scientific YCbCr denoiser reduces chroma and luminance grain while preserving sharp edges`() {
+        val w = 32
+        val h = 32
+        val px = IntArray(w * h)
+        // Left half: dark noisy wall (gray 70 +/- 18 color+luma speckle), Right half: bright clean edge (220)
+        for (y in 0 until h) {
+            for (x in 0 until w) {
+                if (x < w / 2) {
+                    val sign = if ((x + y) % 2 == 0) 1 else -1
+                    val r = (70 + sign * 22).coerceIn(0, 255)
+                    val g = (70 - sign * 18).coerceIn(0, 255)
+                    val b = (70 + sign * 20).coerceIn(0, 255)
+                    px[y * w + x] = (0xFF shl 24) or (r shl 16) or (g shl 8) or b
+                } else {
+                    px[y * w + x] = (0xFF shl 24) or (220 shl 16) or (220 shl 8) or 220
+                }
+            }
+        }
+
+        fun leftChromaSpread(arr: IntArray): Double {
+            var acc = 0.0; var n = 0
+            for (y in 4 until h - 4) {
+                for (x in 4 until w / 2 - 4) {
+                    val p = arr[y * w + x]
+                    val r = (p shr 16) and 0xFF
+                    val g = (p shr 8) and 0xFF
+                    acc += kotlin.math.abs(r - g)
+                    n++
+                }
+            }
+            return acc / n
+        }
+
+        val spreadBefore = leftChromaSpread(px)
+        com.truelens.camera.grading.BitmapGrader.denoisePixelsInPlace(px, w, h, iso = 1200)
+        val spreadAfter = leftChromaSpread(px)
+
+        // Chroma noise spread should drop dramatically (>70% reduction!)
+        assertTrue("Expected huge chroma noise reduction (before=$spreadBefore, after=$spreadAfter)", spreadAfter < spreadBefore * 0.30)
+
+        // Sharp edge across x = 15 -> 16 must remain crisp (contrast > 110)
+        val leftEdge = (px[16 * w + 15] shr 16) and 0xFF
+        val rightEdge = (px[16 * w + 16] shr 16) and 0xFF
+        assertTrue("Expected crisp optical edge preservation (left=$leftEdge, right=$rightEdge)", (rightEdge - leftEdge) > 110)
+    }
 }

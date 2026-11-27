@@ -13,7 +13,7 @@ data class TimeLapseState(
     fun formattedElapsed(): String {
         val m = elapsedSeconds / 60
         val s = elapsedSeconds % 60
-        return String.format("%02d:%02d", m, s)
+        return String.format(java.util.Locale.US, "%02d:%02d", m, s)
     }
 
     companion object {

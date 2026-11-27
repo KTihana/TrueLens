@@ -21,6 +21,8 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -65,6 +67,8 @@ fun PrecisionTickRuler(
     val span = (valueRange.endInclusive - valueRange.start).coerceAtLeast(0.0001f)
     val norm = ((value - valueRange.start) / span).coerceIn(0f, 1f)
     val zeroNorm = ((defaultValue - valueRange.start) / span).coerceIn(0f, 1f)
+    val latestOnValueChange by rememberUpdatedState(onValueChange)
+    val latestDefaultValue by rememberUpdatedState(defaultValue)
 
     Column(
         modifier = modifier.fillMaxWidth(),
@@ -77,7 +81,7 @@ fun PrecisionTickRuler(
             fontWeight = FontWeight.SemiBold,
             modifier = Modifier
                 .clip(RoundedCornerShape(10.dp))
-                .clickable { onValueChange(defaultValue) }
+                .clickable { latestOnValueChange(latestDefaultValue) }
                 .padding(horizontal = 10.dp, vertical = 2.dp)
         )
 
@@ -89,17 +93,17 @@ fun PrecisionTickRuler(
                 .height(34.dp)
                 .pointerInput(valueRange) {
                     detectTapGestures(
-                        onDoubleTap = { onValueChange(defaultValue) },
+                        onDoubleTap = { latestOnValueChange(latestDefaultValue) },
                         onTap = { pos ->
                             val frac = (pos.x / size.width.toFloat()).coerceIn(0f, 1f)
-                            onValueChange(valueRange.start + frac * span)
+                            latestOnValueChange(valueRange.start + frac * span)
                         }
                     )
                 }
                 .pointerInput(valueRange) {
                     detectHorizontalDragGestures { change, _ ->
                         val frac = (change.position.x / size.width.toFloat()).coerceIn(0f, 1f)
-                        onValueChange(valueRange.start + frac * span)
+                        latestOnValueChange(valueRange.start + frac * span)
                     }
                 }
         ) {

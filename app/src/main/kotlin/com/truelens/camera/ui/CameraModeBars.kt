@@ -138,7 +138,7 @@ internal fun CameraModeControlBars(
                             val ss = state.videoElapsedSec % 60
                             val prefix = if (state.isVideoPaused) "⏸ PAUSED" else "● REC"
                             Text(
-                                text = String.format("%s  %02d:%02d  •  %s", prefix, mm, ss, state.videoFpsBadge),
+                                text = String.format(java.util.Locale.US, "%s  %02d:%02d  •  %s", prefix, mm, ss, state.videoFpsBadge),
                                 color = if (state.isVideoPaused) Color(0xFFFFB300) else TrueLensPalette.RecordCoral,
                                 fontSize = 12.sp,
                                 fontWeight = FontWeight.SemiBold
@@ -760,7 +760,7 @@ internal fun CameraModeControlBars(
                             verticalAlignment = Alignment.CenterVertically
                         ) {
                             Text(
-                                text = String.format("%df • %.1fs", sm.frameCount, sm.durationSec),
+                                text = String.format(java.util.Locale.US, "%df • %.1fs", sm.frameCount, sm.durationSec),
                                 color = Color.White,
                                 fontSize = 10.sp,
                                 fontWeight = FontWeight.Bold,

@@ -122,7 +122,7 @@ fun QuickToolsSheet(
                 icon = Icons.Default.RawOn,
                 label = "Format",
                 valueText = settings.captureFormat.badge,
-                active = true,
+                active = false,
                 onClick = onCycleFormat,
                 modifier = Modifier.weight(1f)
             )

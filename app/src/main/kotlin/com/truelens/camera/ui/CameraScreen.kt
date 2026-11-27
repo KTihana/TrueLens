@@ -384,7 +384,7 @@ fun CameraScreen(
                     MinimalTopIconButton(
                         icon = Icons.Default.Palette,
                         contentDescription = "Live Filters & Grading",
-                        active = state.activeDeck == ActiveDeck.LIGHTROOM || !state.grade.isNeutral,
+                        active = state.activeDeck == ActiveDeck.LIGHTROOM,
                         onClick = {
                             showQuickTools = false
                             showMoreModes = false
@@ -519,9 +519,14 @@ fun CameraScreen(
                                     )
                                 }
                             }
-                            .pointerInput(Unit) {
+                            .pointerInput(showQuickTools, state.activeDeck) {
                                 detectTapGestures(
                                     onTap = { offset ->
+                                        if (showQuickTools || state.activeDeck != ActiveDeck.NONE) {
+                                            showQuickTools = false
+                                            viewModel.setActiveDeck(ActiveDeck.NONE)
+                                            return@detectTapGestures
+                                        }
                                         val nx = (offset.x / size.width.toFloat()).coerceIn(0f, 1f)
                                         val ny = (offset.y / size.height.toFloat()).coerceIn(0f, 1f)
                                         focusTapPos = Offset(nx, ny)
@@ -609,12 +614,13 @@ fun CameraScreen(
                     }
 
                     // STOP MOTION ONION-SKIN LAST FRAME OVERLAY (1:1 ContentScale.Fit aligned pixel-for-pixel with viewfinder)
+                    val smBmp = state.stopMotionState.lastFrameBitmap
                     if (state.settings.shootingMode == ShootingMode.STOP_MO &&
                         state.stopMotionState.onionSkinEnabled &&
-                        state.stopMotionState.lastFrameBitmap != null
+                        smBmp != null && !smBmp.isRecycled
                     ) {
                         Image(
-                            bitmap = state.stopMotionState.lastFrameBitmap!!.asImageBitmap(),
+                            bitmap = smBmp.asImageBitmap(),
                             contentDescription = "Stop Motion Onion Skin",
                             contentScale = ContentScale.Fit,
                             alpha = state.stopMotionState.onionSkinOpacity,
@@ -1097,7 +1103,7 @@ fun CameraScreen(
                             )
                             Spacer(modifier = Modifier.height(4.dp))
                             Text(
-                                text = String.format("%+.1f", evDisplay),
+                                text = String.format(java.util.Locale.US, "%+.1f", evDisplay),
                                 color = Color.White,
                                 fontSize = 11.sp,
                                 fontWeight = FontWeight.SemiBold
@@ -1610,6 +1616,8 @@ fun CameraScreen(
                                 modifier = Modifier
                                     .clickable {
                                         showMoreModes = false
+                                        showQuickTools = false
+                                        viewModel.setActiveDeck(ActiveDeck.NONE)
                                         viewModel.setShootingMode(mode)
                                     }
                                     .padding(horizontal = 6.dp, vertical = 4.dp)
@@ -1695,9 +1703,10 @@ fun CameraScreen(
                                     .clickable { viewModel.openGallery() },
                                 contentAlignment = Alignment.Center
                             ) {
-                                if (state.lastThumbnail != null) {
+                                val thumbBmp = state.lastThumbnail
+                                if (thumbBmp != null && !thumbBmp.isRecycled) {
                                     Image(
-                                        bitmap = state.lastThumbnail!!.asImageBitmap(),
+                                        bitmap = thumbBmp.asImageBitmap(),
                                         contentDescription = "Open Gallery",
                                         contentScale = ContentScale.Crop,
                                         modifier = Modifier.fillMaxSize()

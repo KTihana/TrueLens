@@ -165,7 +165,7 @@ data class LensInfo(
 
 data class ManualSettings(
     val exposureMode: ExposureMode = ExposureMode.AUTO_P,
-    val captureFormat: CaptureFormat = CaptureFormat.RAW_PLUS_JPG,
+    val captureFormat: CaptureFormat = CaptureFormat.CLEAN_JPG,
     val shootingMode: ShootingMode = ShootingMode.PHOTO,
     val iso: Int? = null,
     val shutterSpeedNs: Long? = null,
@@ -173,7 +173,7 @@ data class ManualSettings(
     val focusDistanceDiopters: Float? = null,
     val whiteBalanceKelvin: Int? = null,
     val zeroAiBypass: Boolean = true,
-    val trueLightAuto: Boolean = true,
+    val trueLightAuto: Boolean = false,
     val aeAfLocked: Boolean = false,
     val focusPeaking: Boolean = false,
     val zebras: Boolean = false,
@@ -233,14 +233,14 @@ data class LiveTelemetry(
         if (shutterSpeedNs <= 0L) return "AUTO"
         val seconds = shutterSpeedNs / 1_000_000_000.0
         return if (seconds >= 0.5) {
-            String.format("%.1fs", seconds)
+            String.format(java.util.Locale.US, "%.1fs", seconds)
         } else {
             val denom = (1.0 / seconds).toInt().coerceAtLeast(1)
             "1/${denom}s"
         }
     }
 
-    fun formattedAperture(): String = String.format("f/%.1f", aperture)
+    fun formattedAperture(): String = String.format(java.util.Locale.US, "f/%.1f", aperture)
 }
 
 data class CapturedPhoto(

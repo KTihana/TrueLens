@@ -20,6 +20,9 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.gestures.detectHorizontalDragGestures
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.runtime.key
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -522,16 +525,25 @@ fun GalleryScreen(
             )
         }
 
-        // Full-Screen In-App Video Player Overlay
+        // Full-Screen In-App Video Player Overlay (Swipe left/right between videos!)
         val activeVideo = playingVideo
         if (activeVideo != null) {
-            GalleryVideoPlayerOverlay(
-                item = activeVideo,
-                isFavorite = activeVideo.uri.toString() in favorites,
-                onToggleFavorite = {
-                    favorites = GalleryFavoritesStore.toggle(context, activeVideo.uri)
-                },
-                onBack = { playingVideo = null },
+            val videoList = remember(filtered) { filtered.filter { it.isVideo } }
+            val vIdx = videoList.indexOfFirst { it.uri == activeVideo.uri }
+            key(activeVideo.uri) {
+                GalleryVideoPlayerOverlay(
+                    item = activeVideo,
+                    isFavorite = activeVideo.uri.toString() in favorites,
+                    onToggleFavorite = {
+                        favorites = GalleryFavoritesStore.toggle(context, activeVideo.uri)
+                    },
+                    onSwipeNext = {
+                        if (vIdx in 0 until videoList.lastIndex) playingVideo = videoList[vIdx + 1]
+                    },
+                    onSwipePrev = {
+                        if (vIdx > 0) playingVideo = videoList[vIdx - 1]
+                    },
+                    onBack = { playingVideo = null },
                 onShare = {
                     val shareIntent = Intent(Intent.ACTION_SEND).apply {
                         type = "video/mp4"
@@ -553,11 +565,12 @@ fun GalleryScreen(
                         onMediaDeleted()
                     }
                 },
-                onExportedNewMedia = {
-                    refreshKey++
-                    onMediaDeleted()
-                }
-            )
+                    onExportedNewMedia = {
+                        refreshKey++
+                        onMediaDeleted()
+                    }
+                )
+            }
         }
     }
 }
@@ -567,6 +580,8 @@ private fun GalleryVideoPlayerOverlay(
     item: GalleryPhotoItem,
     isFavorite: Boolean,
     onToggleFavorite: () -> Unit,
+    onSwipeNext: () -> Unit = {},
+    onSwipePrev: () -> Unit = {},
     onBack: () -> Unit,
     onShare: () -> Unit,
     onDelete: () -> Unit,
@@ -722,7 +737,19 @@ private fun GalleryVideoPlayerOverlay(
         Box(
             modifier = Modifier
                 .weight(1f)
-                .fillMaxWidth(),
+                .fillMaxWidth()
+                .pointerInput(item.uri) {
+                    var dragAccum = 0f
+                    detectHorizontalDragGestures(
+                        onDragStart = { dragAccum = 0f },
+                        onHorizontalDrag = { _, dragAmount -> dragAccum += dragAmount },
+                        onDragEnd = {
+                            if (dragAccum < -90f) onSwipeNext()
+                            else if (dragAccum > 90f) onSwipePrev()
+                            dragAccum = 0f
+                        }
+                    )
+                },
             contentAlignment = Alignment.Center
         ) {
             AndroidView(
@@ -1069,9 +1096,10 @@ private fun GalleryTile(
                 onLongClick = onLongClick
             )
     ) {
-        if (bmp != null) {
+        val tileBmp = bmp
+        if (tileBmp != null && !tileBmp.isRecycled) {
             Image(
-                bitmap = bmp!!.asImageBitmap(),
+                bitmap = tileBmp.asImageBitmap(),
                 contentDescription = item.displayName,
                 contentScale = ContentScale.Crop,
                 modifier = Modifier.fillMaxSize()

@@ -8,7 +8,18 @@ import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.gestures.calculateCentroidSize
+import androidx.compose.foundation.gestures.calculatePan
+import androidx.compose.foundation.gestures.calculateZoom
 import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.input.pointer.positionChanged
+import kotlin.math.abs
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -138,12 +149,30 @@ fun DarkroomScreen(
     val recentShots by produceState<List<GalleryPhotoItem>>(initialValue = emptyList(), state.darkroomSourceUri) {
         value = queryTrueLensGallery(context, includeVideos = false)
     }
+    val currentUri = state.darkroomSourceUri ?: state.lastCapturedPhoto?.jpegUri
+    val currentPhotoIdx = remember(recentShots, currentUri) {
+        recentShots.indexOfFirst { it.uri == currentUri }
+    }
+    var swipeDragX by remember(currentUri) { mutableFloatStateOf(0f) }
+    var photoZoom by remember(currentUri) { mutableFloatStateOf(1f) }
+    var photoPanX by remember(currentUri) { mutableFloatStateOf(0f) }
+    var photoPanY by remember(currentUri) { mutableFloatStateOf(0f) }
+    val filmstripListState = rememberLazyListState()
+    LaunchedEffect(currentPhotoIdx) {
+        if (currentPhotoIdx >= 0) {
+            filmstripListState.animateScrollToItem((currentPhotoIdx - 2).coerceAtLeast(0))
+        }
+    }
 
-    // Small base thumbnail for fast real-time graded preset preview tiles
+    // Small true-aspect base thumbnail for real-time graded preset preview tiles (NEVER stretches faces!)
     val tinyBaseBitmap by produceState<Bitmap?>(initialValue = null, state.darkroomSourceBitmap) {
         value = withContext(Dispatchers.Default) {
             val src = state.darkroomSourceBitmap ?: return@withContext null
-            Bitmap.createScaledBitmap(src, 140, 140, true)
+            val maxDim = 180f
+            val scale = (maxDim / maxOf(src.width, src.height).coerceAtLeast(1)).coerceAtMost(1f)
+            val tw = (src.width * scale).toInt().coerceAtLeast(1)
+            val th = (src.height * scale).toInt().coerceAtLeast(1)
+            Bitmap.createScaledBitmap(src, tw, th, true)
         }
     }
 
@@ -154,21 +183,21 @@ fun DarkroomScreen(
             .statusBarsPadding()
             .navigationBarsPadding()
     ) {
-        // Top Bar: Circular Back + Undo/Redo + Share/Delete + White "Export" Pill (matching Reference Image #2!)
+        // Top Bar: Compact circular icons + single-line "Export" pill (NEVER wraps/breaks words!)
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(horizontal = 14.dp, vertical = 10.dp),
+                .padding(horizontal = 10.dp, vertical = 10.dp),
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.SpaceBetween
         ) {
             Row(
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                horizontalArrangement = Arrangement.spacedBy(5.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 Box(
                     modifier = Modifier
-                        .size(38.dp)
+                        .size(34.dp)
                         .clip(CircleShape)
                         .background(Color(0x1EFFFFFF))
                         .clickable { onClose() },
@@ -176,14 +205,14 @@ fun DarkroomScreen(
                 ) {
                     Icon(
                         imageVector = Icons.AutoMirrored.Filled.ArrowBack,
-                        contentDescription = "Back",
+                        contentDescription = "Back to Photos",
                         tint = Color.White,
-                        modifier = Modifier.size(19.dp)
+                        modifier = Modifier.size(18.dp)
                     )
                 }
                 Box(
                     modifier = Modifier
-                        .size(36.dp)
+                        .size(31.dp)
                         .clip(CircleShape)
                         .background(Color(0x14FFFFFF))
                         .clickable(enabled = state.canUndoDarkroom) { onUndo() },
@@ -193,12 +222,12 @@ fun DarkroomScreen(
                         imageVector = Icons.AutoMirrored.Filled.Undo,
                         contentDescription = "Undo",
                         tint = if (state.canUndoDarkroom) Color.White else Color.White.copy(alpha = 0.28f),
-                        modifier = Modifier.size(18.dp)
+                        modifier = Modifier.size(16.dp)
                     )
                 }
                 Box(
                     modifier = Modifier
-                        .size(36.dp)
+                        .size(31.dp)
                         .clip(CircleShape)
                         .background(Color(0x14FFFFFF))
                         .clickable(enabled = state.canRedoDarkroom) { onRedo() },
@@ -208,13 +237,13 @@ fun DarkroomScreen(
                         imageVector = Icons.AutoMirrored.Filled.Redo,
                         contentDescription = "Redo",
                         tint = if (state.canRedoDarkroom) Color.White else Color.White.copy(alpha = 0.28f),
-                        modifier = Modifier.size(18.dp)
+                        modifier = Modifier.size(16.dp)
                     )
                 }
             }
 
             Row(
-                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                horizontalArrangement = Arrangement.spacedBy(4.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 val activeUri = state.darkroomSourceUri ?: state.lastCapturedPhoto?.jpegUri
@@ -222,7 +251,7 @@ fun DarkroomScreen(
                     val isFav = activeUri.toString() in favoriteSet
                     Box(
                         modifier = Modifier
-                            .size(34.dp)
+                            .size(31.dp)
                             .clip(CircleShape)
                             .background(if (isFav) TrueLensPalette.RecordCoral.copy(alpha = 0.25f) else Color(0x14FFFFFF))
                             .clickable {
@@ -234,12 +263,12 @@ fun DarkroomScreen(
                             imageVector = if (isFav) Icons.Default.Favorite else Icons.Default.FavoriteBorder,
                             contentDescription = "Favorite Photo",
                             tint = if (isFav) TrueLensPalette.RecordCoral else Color.White,
-                            modifier = Modifier.size(16.dp)
+                            modifier = Modifier.size(15.dp)
                         )
                     }
                     Box(
                         modifier = Modifier
-                            .size(34.dp)
+                            .size(31.dp)
                             .clip(CircleShape)
                             .background(Color(0x14FFFFFF))
                             .clickable { showExifDialog = true },
@@ -249,12 +278,12 @@ fun DarkroomScreen(
                             imageVector = Icons.Default.Info,
                             contentDescription = "Photo EXIF Info",
                             tint = Color.White,
-                            modifier = Modifier.size(16.dp)
+                            modifier = Modifier.size(15.dp)
                         )
                     }
                     Box(
                         modifier = Modifier
-                            .size(34.dp)
+                            .size(31.dp)
                             .clip(CircleShape)
                             .background(Color(0x14FFFFFF))
                             .clickable {
@@ -271,12 +300,12 @@ fun DarkroomScreen(
                             imageVector = Icons.Default.Share,
                             contentDescription = "Share Photo",
                             tint = Color.White,
-                            modifier = Modifier.size(16.dp)
+                            modifier = Modifier.size(15.dp)
                         )
                     }
                     Box(
                         modifier = Modifier
-                            .size(34.dp)
+                            .size(31.dp)
                             .clip(CircleShape)
                             .background(Color(0x14FFFFFF))
                             .clickable { showDeleteConfirm = true },
@@ -286,44 +315,130 @@ fun DarkroomScreen(
                             imageVector = Icons.Default.Delete,
                             contentDescription = "Delete Photo",
                             tint = Color.White.copy(alpha = 0.85f),
-                            modifier = Modifier.size(16.dp)
+                            modifier = Modifier.size(15.dp)
                         )
                     }
                 }
+                Spacer(modifier = Modifier.width(2.dp))
                 Box(
                     modifier = Modifier
-                        .clip(RoundedCornerShape(20.dp))
+                        .clip(RoundedCornerShape(18.dp))
                         .background(Color.White)
                         .clickable(enabled = !state.isExportingDarkroom) { onExport() }
-                        .padding(horizontal = 15.dp, vertical = 8.dp),
+                        .padding(horizontal = 13.dp, vertical = 7.dp),
                     contentAlignment = Alignment.Center
                 ) {
                     if (state.isExportingDarkroom) {
                         CircularProgressIndicator(
                             color = Color.Black,
                             strokeWidth = 2.dp,
-                            modifier = Modifier.size(16.dp)
+                            modifier = Modifier.size(15.dp)
                         )
                     } else {
                         Text(
                             text = "Export",
                             color = Color.Black,
-                            fontSize = 13.sp,
-                            fontWeight = FontWeight.SemiBold
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            maxLines = 1,
+                            softWrap = false
                         )
                     }
                 }
             }
         }
 
-        // Rounded Photo Card (matching Reference Image #2)
+        // Rounded Photo Card (Pinch-to-Zoom 1x-6x + Pan + Double-Tap Zoom + Swipe Left/Right to browse!)
         Box(
             modifier = Modifier
                 .weight(1f)
                 .fillMaxWidth()
                 .padding(horizontal = 14.dp)
                 .clip(RoundedCornerShape(24.dp))
-                .background(TrueLensPalette.SurfaceDark),
+                .background(TrueLensPalette.SurfaceDark)
+                .pointerInput(currentUri, showKeyPhotoPicker) {
+                    if (!showKeyPhotoPicker) {
+                        detectTapGestures(
+                            onDoubleTap = {
+                                if (photoZoom > 1.05f) {
+                                    photoZoom = 1f
+                                    photoPanX = 0f
+                                    photoPanY = 0f
+                                } else {
+                                    photoZoom = 2.5f
+                                    photoPanX = 0f
+                                    photoPanY = 0f
+                                }
+                            }
+                        )
+                    }
+                }
+                .pointerInput(recentShots, currentPhotoIdx, showKeyPhotoPicker) {
+                    if (!showKeyPhotoPicker) {
+                        awaitEachGesture {
+                            awaitFirstDown(requireUnconsumed = false)
+                            var isMultiTouch = false
+                            var dragXAccum = 0f
+                            do {
+                                val event = awaitPointerEvent()
+                                val pressedCount = event.changes.count { it.pressed }
+                                if (pressedCount >= 2) {
+                                    isMultiTouch = true
+                                    swipeDragX = 0f
+                                    val zoomChange = event.calculateZoom()
+                                    val panChange = event.calculatePan()
+                                    val nextZoom = (photoZoom * zoomChange).coerceIn(1f, 6f)
+                                    photoZoom = nextZoom
+                                    if (nextZoom <= 1.02f) {
+                                        photoZoom = 1f
+                                        photoPanX = 0f
+                                        photoPanY = 0f
+                                    } else {
+                                        val maxPanX = size.width * (nextZoom - 1f) * 0.5f
+                                        val maxPanY = size.height * (nextZoom - 1f) * 0.5f
+                                        photoPanX = (photoPanX + panChange.x).coerceIn(-maxPanX, maxPanX)
+                                        photoPanY = (photoPanY + panChange.y).coerceIn(-maxPanY, maxPanY)
+                                    }
+                                    event.changes.forEach { if (it.positionChanged()) it.consume() }
+                                } else if (pressedCount == 1 && !isMultiTouch) {
+                                    val panChange = event.calculatePan()
+                                    if (photoZoom > 1.03f) {
+                                        // Pan smoothly inside zoomed photo
+                                        val maxPanX = size.width * (photoZoom - 1f) * 0.5f
+                                        val maxPanY = size.height * (photoZoom - 1f) * 0.5f
+                                        photoPanX = (photoPanX + panChange.x).coerceIn(-maxPanX, maxPanX)
+                                        photoPanY = (photoPanY + panChange.y).coerceIn(-maxPanY, maxPanY)
+                                        if (panChange.x != 0f || panChange.y != 0f) {
+                                            event.changes.forEach { if (it.positionChanged()) it.consume() }
+                                        }
+                                    } else if (recentShots.size > 1 && currentPhotoIdx >= 0) {
+                                        // At 1x zoom: swipe left/right to flip between photos!
+                                        if (abs(panChange.x) > abs(panChange.y) * 0.7f || abs(dragXAccum) > 12f) {
+                                            val atStart = currentPhotoIdx == 0 && (dragXAccum + panChange.x) > 0f
+                                            val atEnd = currentPhotoIdx == recentShots.lastIndex && (dragXAccum + panChange.x) < 0f
+                                            val damp = if (atStart || atEnd) 0.25f else 1f
+                                            dragXAccum = (dragXAccum + panChange.x * damp).coerceIn(-360f, 360f)
+                                            swipeDragX = dragXAccum
+                                            event.changes.forEach { if (it.positionChanged()) it.consume() }
+                                        }
+                                    }
+                                }
+                            } while (event.changes.any { it.pressed })
+
+                            if (!isMultiTouch && photoZoom <= 1.03f && recentShots.size > 1 && currentPhotoIdx >= 0) {
+                                val dx = swipeDragX
+                                swipeDragX = 0f
+                                if (dx < -80f && currentPhotoIdx < recentShots.lastIndex) {
+                                    onSelectFilmstripUri(recentShots[currentPhotoIdx + 1].uri)
+                                } else if (dx > 80f && currentPhotoIdx > 0) {
+                                    onSelectFilmstripUri(recentShots[currentPhotoIdx - 1].uri)
+                                }
+                            } else {
+                                swipeDragX = 0f
+                            }
+                        }
+                    }
+                },
             contentAlignment = Alignment.Center
         ) {
             val activeKeyFrame = if (showKeyPhotoPicker && liveKeyFrames.isNotEmpty()) {
@@ -347,20 +462,73 @@ fun DarkroomScreen(
                         try { vv.stopPlayback() } catch (_: Exception) {}
                     }
                 )
-            } else if (activeKeyFrame != null) {
+            } else if (activeKeyFrame != null && !activeKeyFrame.isRecycled) {
                 Image(
                     bitmap = activeKeyFrame.asImageBitmap(),
                     contentDescription = "Selected Key Frame",
                     contentScale = ContentScale.Fit,
                     modifier = Modifier.fillMaxSize()
                 )
-            } else if (displayBitmap != null) {
+            } else if (displayBitmap != null && !displayBitmap.isRecycled) {
                 Image(
                     bitmap = displayBitmap.asImageBitmap(),
                     contentDescription = "Photo Preview",
                     contentScale = ContentScale.Fit,
-                    modifier = Modifier.fillMaxSize()
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .graphicsLayer {
+                            scaleX = photoZoom
+                            scaleY = photoZoom
+                            translationX = photoPanX + swipeDragX
+                            translationY = photoPanY
+                        }
                 )
+            }
+
+            // Zoom Level Pill (visible when pinched/zoomed in — tap to reset to 1x!)
+            if (photoZoom > 1.05f && !showKeyPhotoPicker) {
+                Box(
+                    modifier = Modifier
+                        .align(Alignment.TopStart)
+                        .padding(12.dp)
+                        .clip(RoundedCornerShape(12.dp))
+                        .background(Color(0xBB0D0E12))
+                        .border(0.75.dp, TrueLensPalette.AccentViolet.copy(alpha = 0.7f), RoundedCornerShape(12.dp))
+                        .clickable {
+                            photoZoom = 1f
+                            photoPanX = 0f
+                            photoPanY = 0f
+                        }
+                        .padding(horizontal = 9.dp, vertical = 4.dp)
+                ) {
+                    Text(
+                        text = String.format(Locale.US, "%.1f× • Reset", photoZoom),
+                        color = Color.White,
+                        fontSize = 10.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        maxLines = 1,
+                        softWrap = false
+                    )
+                }
+            }
+
+            // Subtle photo index indicator when browsing multiple photos (e.g. 2 / 15)
+            if (recentShots.size > 1 && currentPhotoIdx >= 0 && !showKeyPhotoPicker) {
+                Box(
+                    modifier = Modifier
+                        .align(Alignment.TopEnd)
+                        .padding(12.dp)
+                        .clip(RoundedCornerShape(12.dp))
+                        .background(Color(0x990D0E12))
+                        .padding(horizontal = 9.dp, vertical = 4.dp)
+                ) {
+                    Text(
+                        text = "${currentPhotoIdx + 1} / ${recentShots.size}",
+                        color = Color.White.copy(alpha = 0.88f),
+                        fontSize = 10.sp,
+                        fontWeight = FontWeight.SemiBold
+                    )
+                }
             }
 
             // LIVE PHOTO Badge + Replay + Key Photo Picker Bar (when photo has a 3s Live Motion clip!)
@@ -538,14 +706,15 @@ fun DarkroomScreen(
 
         Spacer(modifier = Modifier.height(10.dp))
 
-        // Quick Gallery Filmstrip (compact pill thumbs)
+        // Quick Gallery Filmstrip (auto-tracks swipe position across all photos!)
         if (recentShots.size > 1) {
             LazyRow(
+                state = filmstripListState,
                 contentPadding = PaddingValues(horizontal = 16.dp),
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
                 modifier = Modifier.fillMaxWidth()
             ) {
-                items(recentShots.take(16), key = { it.uri.toString() }) { item ->
+                items(recentShots, key = { it.uri.toString() }) { item ->
                     val isCurrent = item.uri == (state.darkroomSourceUri ?: state.lastCapturedPhoto?.jpegUri)
                     val thumb by produceState<Bitmap?>(initialValue = null, item.uri) {
                         value = withContext(Dispatchers.IO) {
@@ -564,9 +733,10 @@ fun DarkroomScreen(
                             )
                             .clickable { onSelectFilmstripUri(item.uri) }
                     ) {
-                        if (thumb != null) {
+                        val t = thumb
+                        if (t != null && !t.isRecycled) {
                             Image(
-                                bitmap = thumb!!.asImageBitmap(),
+                                bitmap = t.asImageBitmap(),
                                 contentDescription = item.displayName,
                                 contentScale = ContentScale.Crop,
                                 modifier = Modifier.fillMaxSize()
@@ -582,10 +752,17 @@ fun DarkroomScreen(
         when (activeTab) {
             DarkroomTab.PRESETS -> {
                 val allPresets = state.customPresets + BuiltInPresets.ALL
+                val srcAspect = remember(state.darkroomSourceBitmap) {
+                    val b = state.darkroomSourceBitmap
+                    if (b != null && b.height > 0) (b.width.toFloat() / b.height.toFloat()).coerceIn(0.62f, 1.45f)
+                    else 0.78f
+                }
+                val cardHeightDp = 96.dp
+                val cardWidthDp = (96f * srcAspect).dp
                 LazyRow(
                     contentPadding = PaddingValues(horizontal = 16.dp),
                     horizontalArrangement = Arrangement.spacedBy(10.dp),
-                    modifier = Modifier.fillMaxWidth().height(98.dp)
+                    modifier = Modifier.fillMaxWidth().height(102.dp)
                 ) {
                     items(allPresets, key = { it.id }) { preset ->
                         val selected = preset.id == selectedPresetId
@@ -597,8 +774,8 @@ fun DarkroomScreen(
                         }
                         Box(
                             modifier = Modifier
-                                .width(78.dp)
-                                .height(92.dp)
+                                .width(cardWidthDp)
+                                .height(cardHeightDp)
                                 .clip(RoundedCornerShape(14.dp))
                                 .background(TrueLensPalette.SurfaceDark)
                                 .border(
@@ -611,11 +788,12 @@ fun DarkroomScreen(
                                     onApplyPreset(preset)
                                 }
                         ) {
-                            if (previewBmp != null) {
+                            val pBmp = previewBmp
+                            if (pBmp != null && !pBmp.isRecycled) {
                                 Image(
-                                    bitmap = previewBmp!!.asImageBitmap(),
+                                    bitmap = pBmp.asImageBitmap(),
                                     contentDescription = preset.name,
-                                    contentScale = ContentScale.Crop,
+                                    contentScale = ContentScale.Fit,
                                     modifier = Modifier.fillMaxSize()
                                 )
                             }
@@ -688,57 +866,60 @@ fun DarkroomScreen(
                         .clip(RoundedCornerShape(20.dp))
                         .background(TrueLensPalette.GlassPanel)
                         .border(0.75.dp, TrueLensPalette.GlassBorder, RoundedCornerShape(20.dp))
-                        .padding(14.dp),
-                    verticalArrangement = Arrangement.spacedBy(12.dp)
+                        .padding(horizontal = 14.dp, vertical = 12.dp),
+                    verticalArrangement = Arrangement.spacedBy(10.dp)
                 ) {
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
+                    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
                         Text(
                             text = "Border & Specs",
                             color = TrueLensPalette.MutedGray,
                             fontSize = 11.sp,
                             fontWeight = FontWeight.Medium
                         )
-                        Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
                             com.truelens.camera.grading.ExportFrameStyle.entries.forEach { style ->
                                 val sel = state.darkroomFrameStyle == style
                                 Box(
                                     modifier = Modifier
+                                        .weight(1f)
                                         .clip(RoundedCornerShape(10.dp))
                                         .background(if (sel) Color.White else Color(0x1EFFFFFF))
                                         .clickable { onSelectFrameStyle(style) }
-                                        .padding(horizontal = 10.dp, vertical = 6.dp)
+                                        .padding(horizontal = 6.dp, vertical = 8.dp),
+                                    contentAlignment = Alignment.Center
                                 ) {
                                     Text(
                                         text = style.label,
                                         color = if (sel) Color.Black else Color.White,
                                         fontSize = 11.sp,
-                                        fontWeight = if (sel) FontWeight.SemiBold else FontWeight.Medium
+                                        fontWeight = if (sel) FontWeight.SemiBold else FontWeight.Medium,
+                                        maxLines = 1,
+                                        softWrap = false
                                     )
                                 }
                             }
                         }
                     }
 
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
+                    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
                         Text(
                             text = "Date Stamp",
                             color = TrueLensPalette.MutedGray,
                             fontSize = 11.sp,
                             fontWeight = FontWeight.Medium
                         )
-                        Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
                             com.truelens.camera.grading.DateStampStyle.entries.forEach { stamp ->
                                 val sel = state.darkroomDateStamp == stamp
                                 Box(
                                     modifier = Modifier
+                                        .weight(1f)
                                         .clip(RoundedCornerShape(10.dp))
                                         .background(
                                             when {
@@ -748,13 +929,16 @@ fun DarkroomScreen(
                                             }
                                         )
                                         .clickable { onSelectDateStamp(stamp) }
-                                        .padding(horizontal = 10.dp, vertical = 6.dp)
+                                        .padding(horizontal = 6.dp, vertical = 8.dp),
+                                    contentAlignment = Alignment.Center
                                 ) {
                                     Text(
                                         text = stamp.label,
                                         color = Color.White,
                                         fontSize = 11.sp,
-                                        fontWeight = if (sel) FontWeight.SemiBold else FontWeight.Medium
+                                        fontWeight = if (sel) FontWeight.SemiBold else FontWeight.Medium,
+                                        maxLines = 1,
+                                        softWrap = false
                                     )
                                 }
                             }

@@ -83,9 +83,11 @@ class TrueLensCameraEngine(
 
     private var lastTelemetryTime = 0L
 
-    // Pending capture correlation for RAW DNG + JPEG dual-save
+    // Pending capture correlation for decoupled RAW DNG + HQ-NR JPEG save
+    private var sessionHasRawOutput: Boolean = false
     private var pendingRawImage: Image? = null
-    private var pendingCaptureResult: TotalCaptureResult? = null
+    private var pendingRawResult: TotalCaptureResult? = null
+    private var pendingJpegResult: TotalCaptureResult? = null
     private var pendingJpegBytes: ByteArray? = null
     private var pendingCaptureExpectsRaw: Boolean = false
     private var pendingCaptureExpectsJpeg: Boolean = false
@@ -233,8 +235,14 @@ class TrueLensCameraEngine(
             jpegReader = null
             rawReader?.close()
             rawReader = null
+            sessionHasRawOutput = false
             pendingRawImage?.close()
             pendingRawImage = null
+            pendingRawResult = null
+            pendingJpegResult = null
+            pendingJpegBytes = null
+            pendingCaptureExpectsRaw = false
+            pendingCaptureExpectsJpeg = false
         } catch (e: Exception) {
             Log.e(TAG, "Error closing camera", e)
         }
@@ -335,11 +343,18 @@ class TrueLensCameraEngine(
             }
             outputs.add(jpegReader!!.surface)
 
-            // Pure 12/14-bit Bayer RAW_SENSOR output (strictly <= 3 outputs for universal HAL compatibility)
-            if (lens.supportsRawSensor && lens.maxRawSize != null) {
+            // Only configure RAW_SENSOR output when user explicitly chooses RAW or RAW+JPG.
+            // Keeping RAW out of the session in default CLEAN mode ensures Android HALs never
+            // throttle or disable full hardware high-quality noise reduction on JPEGs!
+            val rawSize = lens.maxRawSize
+            val includeRawOutput = lens.supportsRawSensor &&
+                rawSize != null &&
+                currentSettings.captureFormat != CaptureFormat.CLEAN_JPG
+            sessionHasRawOutput = includeRawOutput
+            if (includeRawOutput && rawSize != null) {
                 rawReader = ImageReader.newInstance(
-                    lens.maxRawSize.width,
-                    lens.maxRawSize.height,
+                    rawSize.width,
+                    rawSize.height,
                     ImageFormat.RAW_SENSOR,
                     2
                 ).apply {
@@ -351,6 +366,8 @@ class TrueLensCameraEngine(
                     }, handler)
                 }
                 outputs.add(rawReader!!.surface)
+            } else {
+                rawReader = null
             }
 
             val outputConfigs = outputs.map { OutputConfiguration(it) }
@@ -379,7 +396,16 @@ class TrueLensCameraEngine(
     fun updateSettings(settings: ManualSettings, grade: LightroomGrade) {
         this.currentSettings = settings
         this.currentGrade = grade
-        updateRepeatingPreview()
+        val lens = activeLens
+        val wantRawOutput = lens != null &&
+            lens.supportsRawSensor &&
+            lens.maxRawSize != null &&
+            settings.captureFormat != CaptureFormat.CLEAN_JPG
+        if (!isRecordingVideo && cameraDevice != null && previewSurface?.isValid == true && wantRawOutput != sessionHasRawOutput) {
+            createCaptureSession()
+        } else {
+            updateRepeatingPreview()
+        }
     }
 
     fun setZoom(ratio: Float) {
@@ -693,7 +719,8 @@ class TrueLensCameraEngine(
         pendingRawImage?.close()
         pendingRawImage = null
         pendingJpegBytes = null
-        pendingCaptureResult = null
+        pendingRawResult = null
+        pendingJpegResult = null
         pendingCaptureExpectsRaw = false
         pendingCaptureExpectsJpeg = true
         pendingCaptureGrade = grade
@@ -703,6 +730,7 @@ class TrueLensCameraEngine(
         try {
             val builder = device.createCaptureRequest(CameraDevice.TEMPLATE_VIDEO_SNAPSHOT)
             builder.addTarget(reader.surface)
+            builder.setTag("JPEG")
             applyRequestParameters(builder, settings)
             builder.set(CaptureRequest.JPEG_QUALITY, 95.toByte())
             builder.set(CaptureRequest.JPEG_ORIENTATION, lens.sensorOrientation)
@@ -714,7 +742,7 @@ class TrueLensCameraEngine(
                         request: CaptureRequest,
                         result: TotalCaptureResult
                     ) {
-                        pendingCaptureResult = result
+                        pendingJpegResult = result
                         tryFinalizeCapture()
                     }
                 },
@@ -814,7 +842,8 @@ class TrueLensCameraEngine(
         pendingRawImage?.close()
         pendingRawImage = null
         pendingJpegBytes = null
-        pendingCaptureResult = null
+        pendingRawResult = null
+        pendingJpegResult = null
         pendingCaptureExpectsRaw = wantRaw
         pendingCaptureExpectsJpeg = wantJpeg
         pendingCaptureGrade = grade
@@ -824,29 +853,77 @@ class TrueLensCameraEngine(
         try {
             // CRITICAL: Always use TEMPLATE_STILL_CAPTURE so CONTROL_MODE_AUTO, color matrices,
             // lens shading, and converged AE/AWB remain intact on every Android device.
-            // (TEMPLATE_MANUAL defaults CONTROL_MODE=OFF and minimum shutter -> pitch black photos!)
-            val builder = device.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE)
-            if (wantJpeg) jpegReader?.surface?.let { builder.addTarget(it) }
-            if (wantRaw) rawReader?.surface?.let { builder.addTarget(it) }
-
-            applyRequestParameters(builder, settings)
-            builder.set(CaptureRequest.JPEG_QUALITY, 98.toByte())
-            builder.set(CaptureRequest.JPEG_ORIENTATION, lens.sensorOrientation)
-
-            session.capture(
-                builder.build(),
-                object : CameraCaptureSession.CaptureCallback() {
-                    override fun onCaptureCompleted(
-                        session: CameraCaptureSession,
-                        request: CaptureRequest,
-                        result: TotalCaptureResult
-                    ) {
-                        pendingCaptureResult = result
-                        tryFinalizeCapture()
+            //
+            // DECOUPLED CAPTURE FOR RAW+JPG:
+            // Submitting JPEG and RAW as two separate back-to-back requests in captureBurst()
+            // ensures the JPEG request NEVER attaches RAW_SENSOR — preventing Android HALs
+            // from disabling high-quality hardware noise reduction on the JPEG!
+            val callback = object : CameraCaptureSession.CaptureCallback() {
+                override fun onCaptureCompleted(
+                    session: CameraCaptureSession,
+                    request: CaptureRequest,
+                    result: TotalCaptureResult
+                ) {
+                    if (request.tag == "RAW") {
+                        pendingRawResult = result
+                    } else {
+                        pendingJpegResult = result
                     }
-                },
-                backgroundHandler
-            )
+                    tryFinalizeCapture()
+                }
+
+                override fun onCaptureFailed(
+                    session: CameraCaptureSession,
+                    request: CaptureRequest,
+                    failure: android.hardware.camera2.CaptureFailure
+                ) {
+                    Log.w(TAG, "Capture request failed (tag=${request.tag}, reason=${failure.reason})")
+                    if (request.tag == "RAW") {
+                        pendingCaptureExpectsRaw = false
+                        pendingRawImage?.close()
+                        pendingRawImage = null
+                    } else {
+                        pendingCaptureExpectsJpeg = false
+                        pendingJpegBytes = null
+                    }
+                    tryFinalizeCapture()
+                }
+            }
+
+            if (wantJpeg && wantRaw) {
+                val jpegBuilder = device.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE).apply {
+                    jpegReader?.surface?.let { addTarget(it) }
+                    setTag("JPEG")
+                    applyRequestParameters(this, settings)
+                    set(CaptureRequest.JPEG_QUALITY, 98.toByte())
+                    set(CaptureRequest.JPEG_ORIENTATION, lens.sensorOrientation)
+                }
+                val rawBuilder = device.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE).apply {
+                    rawReader?.surface?.let { addTarget(it) }
+                    setTag("RAW")
+                    applyRequestParameters(this, settings)
+                }
+                session.captureBurst(
+                    listOf(jpegBuilder.build(), rawBuilder.build()),
+                    callback,
+                    backgroundHandler
+                )
+            } else {
+                val builder = device.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE)
+                if (wantJpeg) {
+                    jpegReader?.surface?.let { builder.addTarget(it) }
+                    builder.setTag("JPEG")
+                } else if (wantRaw) {
+                    rawReader?.surface?.let { builder.addTarget(it) }
+                    builder.setTag("RAW")
+                }
+                applyRequestParameters(builder, settings)
+                if (wantJpeg) {
+                    builder.set(CaptureRequest.JPEG_QUALITY, 98.toByte())
+                    builder.set(CaptureRequest.JPEG_ORIENTATION, lens.sensorOrientation)
+                }
+                session.capture(builder.build(), callback, backgroundHandler)
+            }
         } catch (e: Exception) {
             Log.e(TAG, "Capture failed", e)
             onError("Capture failed: ${e.message}")
@@ -923,14 +1000,15 @@ class TrueLensCameraEngine(
                 CaptureRequest.STATISTICS_FACE_DETECT_MODE_OFF
             )
             if (useCleanEnhance) {
-                // Clean Enhance: tasteful hardware high-quality noise reduction + gentle crispness
+                // Clean Enhance: hardware HQ noise reduction + EDGE_MODE_OFF (prevents OEM grain-amplifying sharpening halos;
+                // our scientific YCbCr chroma + bilateral + coring clarity pass handles crispness cleanly!)
                 if (supportedNrModes.contains(CaptureRequest.NOISE_REDUCTION_MODE_HIGH_QUALITY)) {
                     builder.set(CaptureRequest.NOISE_REDUCTION_MODE, CaptureRequest.NOISE_REDUCTION_MODE_HIGH_QUALITY)
                 } else if (supportedNrModes.contains(CaptureRequest.NOISE_REDUCTION_MODE_FAST)) {
                     builder.set(CaptureRequest.NOISE_REDUCTION_MODE, CaptureRequest.NOISE_REDUCTION_MODE_FAST)
                 }
-                if (supportedEdgeModes.contains(CaptureRequest.EDGE_MODE_FAST)) {
-                    builder.set(CaptureRequest.EDGE_MODE, CaptureRequest.EDGE_MODE_FAST)
+                if (supportedEdgeModes.contains(CaptureRequest.EDGE_MODE_OFF)) {
+                    builder.set(CaptureRequest.EDGE_MODE, CaptureRequest.EDGE_MODE_OFF)
                 }
             } else {
                 // Default Pure Zero-AI: zero artificial sharpening & minimal noise smearing
@@ -1040,11 +1118,13 @@ class TrueLensCameraEngine(
     }
 
     private fun tryFinalizeCapture() {
-        val result = pendingCaptureResult ?: return
-        if (pendingCaptureExpectsRaw && pendingRawImage == null) return
-        if (pendingCaptureExpectsJpeg && pendingJpegBytes == null) return
+        if (pendingCaptureExpectsRaw && (pendingRawImage == null || pendingRawResult == null)) return
+        if (pendingCaptureExpectsJpeg && (pendingJpegBytes == null || pendingJpegResult == null)) return
 
         val rawImage = pendingRawImage
+        val rawResult = pendingRawResult
+        val jpegResult = pendingJpegResult
+        val primaryResult = jpegResult ?: rawResult ?: return
         val jpegBytes = pendingJpegBytes
         val chars = activeCharacteristics
         val lens = activeLens ?: return
@@ -1054,8 +1134,9 @@ class TrueLensCameraEngine(
 
         // Reset pending state
         pendingRawImage = null
+        pendingRawResult = null
+        pendingJpegResult = null
         pendingJpegBytes = null
-        pendingCaptureResult = null
         pendingCaptureLut = null
 
         ioExecutor.execute {
@@ -1065,16 +1146,17 @@ class TrueLensCameraEngine(
             var savedJpegUri: Uri? = null
 
             try {
-                // 1. Save pure 12/14-bit Bayer RAW DNG if captured
-                if (rawImage != null && chars != null) {
+                // 1. Save pure 12/14-bit Bayer RAW DNG if captured (paired with its exact rawResult!)
+                if (rawImage != null && chars != null && rawResult != null) {
                     try {
-                        savedDngUri = saveDngToMediaStore(rawImage, chars, result, "TrueLens_$stamp.dng")
+                        savedDngUri = saveDngToMediaStore(rawImage, chars, rawResult, "TrueLens_$stamp.dng")
                     } finally {
                         rawImage.close()
                     }
                 }
 
-                // 2. Save Clean / Graded JPEG (with EXIF orientation, optional Clean Enhance, Mirror-Save, .cube LUT & Date Stamp)
+                val iso = primaryResult.get(CaptureResult.SENSOR_SENSITIVITY) ?: 100
+                // 2. Save Clean / Graded JPEG (with EXIF orientation, optional scientific Clean Enhance, Mirror-Save, .cube LUT & Date Stamp)
                 val jpegDisplayName = "TrueLens_$stamp.jpg"
                 if (jpegBytes != null) {
                     val hasDateStamp = settings.dateStampStyle != com.truelens.camera.grading.DateStampStyle.OFF
@@ -1088,7 +1170,7 @@ class TrueLensCameraEngine(
                         )
                         if (oriented != null) {
                             val enhanced = if (useClean) {
-                                BitmapGrader.applyCleanEnhance(oriented).also {
+                                BitmapGrader.applyCleanEnhance(oriented, iso).also {
                                     if (it !== oriented) oriented.recycle()
                                 }
                             } else oriented
@@ -1117,8 +1199,7 @@ class TrueLensCameraEngine(
                     savedJpegUri = saveJpegToMediaStore(finalBytes, jpegDisplayName)
                 }
 
-                val iso = result.get(CaptureResult.SENSOR_SENSITIVITY) ?: 100
-                val exp = result.get(CaptureResult.SENSOR_EXPOSURE_TIME) ?: 16_666_666L
+                val exp = primaryResult.get(CaptureResult.SENSOR_EXPOSURE_TIME) ?: 16_666_666L
                 val formatBadge = when {
                     savedDngUri != null && savedJpegUri != null -> if (settings.enhanceMode == EnhanceMode.CLEAN) "RAW+CLEAN" else "RAW+JPG"
                     savedDngUri != null -> "DNG RAW"

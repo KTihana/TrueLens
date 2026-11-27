@@ -340,7 +340,7 @@ fun LightroomLiveDeck(
     onReset: () -> Unit,
     modifier: Modifier = Modifier
 ) {
-    var modeTab by remember { mutableStateOf(0) } // 0 = Adjust (Tick Ruler), 1 = Presets
+    var modeTab by remember { mutableStateOf(0) } // 0 = Presets, 1 = Adjust (Tick Ruler)
     var selectedTool by remember { mutableStateOf(GradeTool.EXPOSURE) }
     var showSaveDialog by remember { mutableStateOf(false) }
 
@@ -353,7 +353,7 @@ fun LightroomLiveDeck(
             .border(0.75.dp, TrueLensPalette.GlassBorder, RoundedCornerShape(22.dp))
             .padding(horizontal = 14.dp, vertical = 12.dp)
     ) {
-        // Header row: Adjust / Presets tabs (optional) + Split / +LUT / +Save / Reset
+        // Header row: Presets / Adjust tabs (optional) + Split / +LUT / +Save / Reset
         if (showModeTabs || !grade.isNeutral || onToggleSplitScreen != null || onImportCubeLut != null) {
             Row(
                 modifier = Modifier.fillMaxWidth(),
@@ -362,7 +362,7 @@ fun LightroomLiveDeck(
             ) {
                 if (showModeTabs) {
                     Row(horizontalArrangement = Arrangement.spacedBy(14.dp)) {
-                        listOf("Adjust", "Presets").forEachIndexed { idx, title ->
+                        listOf("Presets", "Adjust").forEachIndexed { idx, title ->
                             val active = modeTab == idx
                             Text(
                                 text = title,
@@ -422,7 +422,7 @@ fun LightroomLiveDeck(
             Spacer(modifier = Modifier.height(8.dp))
         }
 
-        if (!showModeTabs || modeTab == 0) {
+        if (!showModeTabs || modeTab == 1) {
             // Multiple Light Leak Style Selector Row (5 unique analog leak styles when Light Leak is active!)
             if (selectedTool == GradeTool.LIGHT_LEAK) {
                 Row(
@@ -588,7 +588,7 @@ fun LightroomLiveDeck(
                         if (recipeName.isNotBlank()) {
                             onSaveCustomPreset(recipeName.trim())
                             showSaveDialog = false
-                            modeTab = 1
+                            modeTab = 0
                         }
                     },
                     colors = ButtonDefaults.buttonColors(containerColor = Color.White, contentColor = Color.Black)
