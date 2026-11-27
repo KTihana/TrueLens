@@ -76,6 +76,8 @@ fun QuickToolsSheet(
     onToggleFloatingShutter: () -> Unit = {},
     onToggleAudioMeter: () -> Unit = {},
     onToggleAutoNightPrompt: () -> Unit = {},
+    onToggleOpticalHdr: () -> Unit = {},
+    onToggleUltraHdr: () -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     Column(
@@ -288,6 +290,31 @@ fun QuickToolsSheet(
                 valueText = if (settings.autoNightPromptEnabled) "On" else "Off",
                 active = settings.autoNightPromptEnabled,
                 onClick = onToggleAutoNightPrompt,
+                modifier = Modifier.weight(1f)
+            )
+        }
+
+        Spacer(modifier = Modifier.height(4.dp))
+
+        // Row 6: Optical HDR (3-Frame Mertens Exposure Fusion) & Ultra HDR (ISO 21496-1 OLED Gainmap)
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(4.dp)
+        ) {
+            GlassGridTile(
+                icon = Icons.Default.AutoAwesome,
+                label = "Optical HDR",
+                valueText = if (settings.opticalHdrEnabled) "3× Fusion" else "Off",
+                active = settings.opticalHdrEnabled,
+                onClick = onToggleOpticalHdr,
+                modifier = Modifier.weight(1f)
+            )
+            GlassGridTile(
+                icon = Icons.Default.WbSunny,
+                label = "Ultra HDR",
+                valueText = if (settings.ultraHdrEnabled) "OLED+" else "Off",
+                active = settings.ultraHdrEnabled,
+                onClick = onToggleUltraHdr,
                 modifier = Modifier.weight(1f)
             )
         }

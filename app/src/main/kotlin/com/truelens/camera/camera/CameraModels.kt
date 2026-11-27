@@ -218,7 +218,10 @@ data class ManualSettings(
     val astroHotPixelClean: Boolean = true,
     val astroStarLoupeEnabled: Boolean = false,
     val doubleExpBlend: DoubleExpBlendMode = DoubleExpBlendMode.SCREEN,
-    val actionPanStrength: Float = 0.65f
+    val actionPanStrength: Float = 0.65f,
+    // Scientific Imaging Suite (Tier 2 & Tier 4)
+    val opticalHdrEnabled: Boolean = false,
+    val ultraHdrEnabled: Boolean = true
 )
 
 data class LiveTelemetry(

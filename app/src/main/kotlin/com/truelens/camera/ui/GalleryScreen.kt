@@ -155,6 +155,8 @@ private enum class GalleryFilter(val label: String) {
 
 @Composable
 fun GalleryScreen(
+    initialVideoUri: Uri? = null,
+    onConsumedInitialVideo: () -> Unit = {},
     onClose: () -> Unit,
     onSelectPhotoForDarkroom: (Uri, String) -> Unit,
     onMediaDeleted: () -> Unit = {}
@@ -191,6 +193,16 @@ fun GalleryScreen(
 
     val allMedia by produceState<List<GalleryPhotoItem>>(initialValue = emptyList(), refreshKey) {
         value = queryTrueLensGallery(context, includeVideos = true)
+    }
+
+    LaunchedEffect(allMedia, initialVideoUri) {
+        if (initialVideoUri != null && allMedia.isNotEmpty()) {
+            val match = allMedia.firstOrNull { it.uri == initialVideoUri }
+            if (match != null) {
+                playingVideo = match
+            }
+            onConsumedInitialVideo()
+        }
     }
 
     val filtered = remember(allMedia, activeFilter, favorites) {

@@ -99,6 +99,7 @@ data class CameraUiState(
     val statusBanner: String? = null,
     val isDarkroomOpen: Boolean = false,
     val isGalleryOpen: Boolean = false,
+    val initialGalleryVideoUri: Uri? = null,
     val darkroomSourceUri: Uri? = null,
     val darkroomSourceBitmap: Bitmap? = null,
     val darkroomGradedBitmap: Bitmap? = null,
@@ -241,6 +242,7 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
     private var astroJob: Job? = null
     private var bannerJob: Job? = null
     private var darkroomPreviewJob: Job? = null
+    private var darkroomLoadJob: Job? = null
     private var openedDarkroomFromGallery: Boolean = false
     private val canonSlotPrefs = application.getSharedPreferences("truelens_canon_slots", Context.MODE_PRIVATE)
     private val appPrefs = application.getSharedPreferences("truelens_prefs", Context.MODE_PRIVATE)
@@ -1077,6 +1079,7 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
 
     fun onGyroAngularSpeed(radPerSec: Float) {
         latestGyroMag = latestGyroMag * 0.45f + radPerSec * 0.55f
+        cameraEngine.updateGyroSpeed(latestGyroMag)
         if (radPerSec > peakGyroDuringCapture) {
             peakGyroDuringCapture = radPerSec
         }
@@ -1805,13 +1808,32 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         }
     }
 
-    // --- FULL IN-APP GALLERY ---
+    // --- FULL IN-APP GALLERY & DIRECT LATEST MEDIA VIEWER ---
     fun openGallery() {
-        _uiState.update { it.copy(isGalleryOpen = true) }
+        _uiState.update { it.copy(isGalleryOpen = true, initialGalleryVideoUri = null) }
     }
 
     fun closeGallery() {
-        _uiState.update { it.copy(isGalleryOpen = false) }
+        _uiState.update { it.copy(isGalleryOpen = false, initialGalleryVideoUri = null) }
+    }
+
+    fun clearInitialGalleryVideo() {
+        _uiState.update { it.copy(initialGalleryVideoUri = null) }
+    }
+
+    /**
+     * Tapping the camera's bottom-left thumbnail opens the exact latest photo (or video)
+     * directly first — pressing Back from it then goes to the Gallery grid!
+     */
+    fun openLatestMedia() {
+        viewModelScope.launch {
+            val latest = queryTrueLensGallery(getApplication(), includeVideos = true).firstOrNull()
+            when {
+                latest == null -> _uiState.update { it.copy(isGalleryOpen = true, initialGalleryVideoUri = null) }
+                latest.isVideo -> _uiState.update { it.copy(isGalleryOpen = true, initialGalleryVideoUri = latest.uri) }
+                else -> openDarkroomForUri(latest.uri)
+            }
+        }
     }
 
     fun openDarkroomForUri(uri: Uri) {
@@ -1820,7 +1842,9 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         }
         darkroomUndoStack.clear()
         darkroomRedoStack.clear()
-        viewModelScope.launch {
+        darkroomPreviewJob?.cancel()
+        darkroomLoadJob?.cancel()
+        darkroomLoadJob = viewModelScope.launch {
             val bmp = loadScaledBitmap(uri, 1280) ?: return@launch
             val exif = withContext(Dispatchers.IO) {
                 com.truelens.camera.grading.PhotoFrameRenderer.readExifSummary(getApplication(), uri)
@@ -2202,7 +2226,25 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
             s.copy(enhanceMode = next)
         }
         val on = _uiState.value.settings.enhanceMode == com.truelens.camera.camera.EnhanceMode.CLEAN
-        showBanner(if (on) "Clean Enhance ON (Subtle Denoise & Crispness)" else "Pure Zero-AI Optics (Default)")
+        showBanner(if (on) "Clean Look ON (4-Frame Sub-Pixel Burst & Wavelet Denoise)" else "Pure Zero-AI Optics (Default)")
+    }
+
+    fun toggleOpticalHdr() {
+        val next = !_uiState.value.settings.opticalHdrEnabled
+        updateSettings { it.copy(opticalHdrEnabled = next) }
+        showBanner(
+            if (next) "Optical HDR ON (3-Frame Mertens Exposure Fusion + AgX)"
+            else "Optical HDR OFF"
+        )
+    }
+
+    fun toggleUltraHdr() {
+        val next = !_uiState.value.settings.ultraHdrEnabled
+        updateSettings { it.copy(ultraHdrEnabled = next) }
+        showBanner(
+            if (next) "Ultra HDR Display Headroom ON (ISO 21496-1 Gainmap)"
+            else "Ultra HDR OFF (Standard SDR JPEG)"
+        )
     }
 
     fun toggleQrScanner() {

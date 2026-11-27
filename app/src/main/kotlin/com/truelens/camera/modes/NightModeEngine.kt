@@ -57,7 +57,7 @@ object NightModeEngine {
 
         withContext(Dispatchers.IO) {
             try {
-                val stamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
+                val stamp = SimpleDateFormat("yyyyMMdd_HHmmss_SSS", Locale.US).format(Date())
                 val values = ContentValues().apply {
                     put(MediaStore.Images.Media.DISPLAY_NAME, "TrueLens_Night_$stamp.jpg")
                     put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")

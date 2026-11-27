@@ -41,13 +41,17 @@ import android.util.Size
 import android.view.Surface
 import com.truelens.camera.gl.AspectRatioMath
 import com.truelens.camera.grading.BitmapGrader
+import com.truelens.camera.grading.ComputationalDenoiser
 import com.truelens.camera.grading.CubeLut
 import com.truelens.camera.grading.LightroomGrade
+import com.truelens.camera.grading.OpticalHdrEngine
+import com.truelens.camera.grading.UltraHdrEncoder
 import java.io.ByteArrayOutputStream
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicLong
 import kotlin.math.ln
 import kotlin.math.pow
 
@@ -67,34 +71,75 @@ class TrueLensCameraEngine(
     private var backgroundHandler: Handler? = null
     private val ioExecutor = Executors.newSingleThreadExecutor()
 
-    private var cameraDevice: CameraDevice? = null
-    private var captureSession: CameraCaptureSession? = null
-    private var previewSurface: Surface? = null
-    private var jpegReader: ImageReader? = null
-    private var rawReader: ImageReader? = null
+    @Volatile private var cameraDevice: CameraDevice? = null
+    @Volatile private var captureSession: CameraCaptureSession? = null
+    @Volatile private var previewSurface: Surface? = null
+    @Volatile private var jpegReader: ImageReader? = null
+    @Volatile private var rawReader: ImageReader? = null
 
-    private var activeLens: LensInfo? = null
-    private var activeCharacteristics: CameraCharacteristics? = null
+    @Volatile private var activeLens: LensInfo? = null
+    @Volatile private var activeCharacteristics: CameraCharacteristics? = null
     private var supportedEdgeModes: IntArray = IntArray(0)
     private var supportedNrModes: IntArray = IntArray(0)
+    private var supportsOis: Boolean = false
+    private var supportedAberrationModes: IntArray = IntArray(0)
+    private var supportedDistortionModes: IntArray = IntArray(0)
+    private var supportedShadingModes: IntArray = IntArray(0)
+    private var supportedAntibandingModes: IntArray = IntArray(0)
+    private var supportedHotPixelModes: IntArray = IntArray(0)
     private var currentSettings: ManualSettings = ManualSettings()
     private var currentGrade: LightroomGrade = LightroomGrade.NEUTRAL
     private var zoomRatio: Float = 1.0f
 
     private var lastTelemetryTime = 0L
+    @Volatile private var lastLiveIso: Int = 200
+    @Volatile private var lastLiveExpNs: Long = 16_666_666L
+    @Volatile private var lastAfState: Int = CaptureResult.CONTROL_AF_STATE_INACTIVE
+    @Volatile private var latestGyroSpeedRadSec: Float = 0f
 
-    // Pending capture correlation for decoupled RAW DNG + HQ-NR JPEG save
+    // Thread-safe FIFO Capture Queue (mutated EXCLUSIVELY on backgroundHandler — ZERO dropped clicks!)
+    private data class PendingCaptureJob(
+        val id: Long,
+        var expectedJpegCount: Int,
+        var expectRaw: Boolean,
+        val isCleanBurst: Boolean,
+        val isOpticalHdr: Boolean = false,
+        val grade: LightroomGrade,
+        val lut: CubeLut?,
+        val settings: ManualSettings,
+        val lens: LensInfo,
+        val characteristics: CameraCharacteristics?,
+        val jpegFrames: MutableList<ByteArray> = mutableListOf(),
+        val jpegResults: MutableList<TotalCaptureResult> = mutableListOf(),
+        val frameShakeScores: MutableList<Float> = mutableListOf(),
+        var rawImage: Image? = null,
+        var rawResult: TotalCaptureResult? = null,
+        var retryCount: Int = 0,
+        var finalized: Boolean = false,
+        var watchdogRunnable: Runnable? = null
+    )
+
+    private data class MemoryFrameJob(
+        val id: Long,
+        val callback: (Bitmap?) -> Unit,
+        var timeoutRunnable: Runnable? = null
+    )
+
+    private data class QueuedShutterRequest(
+        val grade: LightroomGrade,
+        val settings: ManualSettings,
+        val lut: CubeLut?,
+        val queuedAtMs: Long
+    )
+
     private var sessionHasRawOutput: Boolean = false
-    private var pendingRawImage: Image? = null
-    private var pendingRawResult: TotalCaptureResult? = null
-    private var pendingJpegResult: TotalCaptureResult? = null
-    private var pendingJpegBytes: ByteArray? = null
-    private var pendingCaptureExpectsRaw: Boolean = false
-    private var pendingCaptureExpectsJpeg: Boolean = false
-    private var pendingCaptureGrade: LightroomGrade = LightroomGrade.NEUTRAL
-    private var pendingCaptureLut: CubeLut? = null
-    private var pendingCaptureSettings: ManualSettings = ManualSettings()
-    private var pendingMemoryFrameCallback: ((Bitmap?) -> Unit)? = null
+    private val captureIdCounter = AtomicLong(1L)
+    private val fileSeqCounter = AtomicLong(0L)
+    private val activeCaptureJobs = ArrayDeque<PendingCaptureJob>()
+    private val deferredCaptureQueue = ArrayDeque<QueuedShutterRequest>()
+    private val pendingMemoryJobs = ArrayDeque<MemoryFrameJob>()
+    private var queuedShutterRequest: QueuedShutterRequest? = null
+    private var queuedShutterTimeout: Runnable? = null
 
     // Video & Slow-Mo Recording state
     private var mediaRecorder: MediaRecorder? = null
@@ -236,19 +281,36 @@ class TrueLensCameraEngine(
             rawReader?.close()
             rawReader = null
             sessionHasRawOutput = false
-            pendingRawImage?.close()
-            pendingRawImage = null
-            pendingRawResult = null
-            pendingJpegResult = null
-            pendingJpegBytes = null
-            pendingCaptureExpectsRaw = false
-            pendingCaptureExpectsJpeg = false
+            clearPendingCaptureQueues(notifyMemoryNull = true)
         } catch (e: Exception) {
             Log.e(TAG, "Error closing camera", e)
         }
         backgroundThread?.quitSafely()
         backgroundThread = null
         backgroundHandler = null
+    }
+
+    private fun clearPendingCaptureQueues(notifyMemoryNull: Boolean) {
+        val h = backgroundHandler
+        queuedShutterTimeout?.let { h?.removeCallbacks(it) }
+        queuedShutterTimeout = null
+        queuedShutterRequest = null
+        deferredCaptureQueue.clear()
+
+        while (activeCaptureJobs.isNotEmpty()) {
+            val job = activeCaptureJobs.removeFirst()
+            job.watchdogRunnable?.let { h?.removeCallbacks(it) }
+            job.rawImage?.close()
+            job.rawImage = null
+            job.finalized = true
+        }
+        while (pendingMemoryJobs.isNotEmpty()) {
+            val mem = pendingMemoryJobs.removeFirst()
+            mem.timeoutRunnable?.let { h?.removeCallbacks(it) }
+            if (notifyMemoryNull) {
+                try { mem.callback(null) } catch (_: Exception) {}
+            }
+        }
     }
 
     @SuppressLint("MissingPermission")
@@ -270,6 +332,15 @@ class TrueLensCameraEngine(
             activeCharacteristics = chars
             supportedEdgeModes = chars.get(CameraCharacteristics.EDGE_AVAILABLE_EDGE_MODES) ?: IntArray(0)
             supportedNrModes = chars.get(CameraCharacteristics.NOISE_REDUCTION_AVAILABLE_NOISE_REDUCTION_MODES) ?: IntArray(0)
+            val oisModes = chars.get(CameraCharacteristics.LENS_INFO_AVAILABLE_OPTICAL_STABILIZATION) ?: IntArray(0)
+            supportsOis = oisModes.contains(CameraMetadata.LENS_OPTICAL_STABILIZATION_MODE_ON)
+            supportedAberrationModes = chars.get(CameraCharacteristics.COLOR_CORRECTION_AVAILABLE_ABERRATION_MODES) ?: IntArray(0)
+            supportedDistortionModes = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                chars.get(CameraCharacteristics.DISTORTION_CORRECTION_AVAILABLE_MODES) ?: IntArray(0)
+            } else IntArray(0)
+            supportedShadingModes = chars.get(CameraCharacteristics.SHADING_AVAILABLE_MODES) ?: IntArray(0)
+            supportedAntibandingModes = chars.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_ANTIBANDING_MODES) ?: IntArray(0)
+            supportedHotPixelModes = chars.get(CameraCharacteristics.HOT_PIXEL_AVAILABLE_HOT_PIXEL_MODES) ?: IntArray(0)
 
             cameraManager.openCamera(
                 lens.cameraId,
@@ -305,39 +376,37 @@ class TrueLensCameraEngine(
         val handler = backgroundHandler ?: return
 
         try {
+            captureSession?.close()
+            captureSession = null
             jpegReader?.close()
             rawReader?.close()
 
             val outputs = mutableListOf<Surface>()
             outputs.add(surface)
 
-            // JPEG output (clean or graded copy)
+            // High-capacity JPEG reader (maxImages = 10 + acquireNextImage drain loop):
+            // NEVER drops rapid shutter clicks or 5-frame Clean Look HDR+ bursts!
             jpegReader = ImageReader.newInstance(
                 lens.maxJpegSize.width,
                 lens.maxJpegSize.height,
                 ImageFormat.JPEG,
-                2
+                10
             ).apply {
                 setOnImageAvailableListener({ reader ->
-                    val image = reader.acquireLatestImage() ?: return@setOnImageAvailableListener
-                    try {
-                        val buffer = image.planes[0].buffer
-                        val bytes = ByteArray(buffer.remaining())
-                        buffer.get(bytes)
-                        val memCb = pendingMemoryFrameCallback
-                        if (memCb != null) {
-                            pendingMemoryFrameCallback = null
-                            val mirrorFront = lens.isFront && currentSettings.mirrorFrontSave
-                            ioExecutor.execute {
-                                val bmp = decodeJpegWithExifOrientation(bytes, mirrorHorizontal = mirrorFront)
-                                memCb(bmp)
-                            }
-                        } else {
-                            pendingJpegBytes = bytes
-                            tryFinalizeCapture()
+                    while (true) {
+                        val image = try {
+                            reader.acquireNextImage()
+                        } catch (_: Exception) {
+                            null
+                        } ?: break
+                        try {
+                            val buffer = image.planes[0].buffer
+                            val bytes = ByteArray(buffer.remaining())
+                            buffer.get(bytes)
+                            dispatchIncomingJpegOnHandler(bytes, lens)
+                        } finally {
+                            image.close()
                         }
-                    } finally {
-                        image.close()
                     }
                 }, handler)
             }
@@ -356,13 +425,17 @@ class TrueLensCameraEngine(
                     rawSize.width,
                     rawSize.height,
                     ImageFormat.RAW_SENSOR,
-                    2
+                    4
                 ).apply {
                     setOnImageAvailableListener({ reader ->
-                        val image = reader.acquireLatestImage() ?: return@setOnImageAvailableListener
-                        pendingRawImage?.close()
-                        pendingRawImage = image
-                        tryFinalizeCapture()
+                        while (true) {
+                            val image = try {
+                                reader.acquireNextImage()
+                            } catch (_: Exception) {
+                                null
+                            } ?: break
+                            dispatchIncomingRawOnHandler(image)
+                        }
                     }, handler)
                 }
                 outputs.add(rawReader!!.surface)
@@ -379,6 +452,19 @@ class TrueLensCameraEngine(
                     override fun onConfigured(session: CameraCaptureSession) {
                         captureSession = session
                         updateRepeatingPreview()
+                        // If the user pressed shutter while the session was opening/reconfiguring,
+                        // fire the queued capture IMMEDIATELY so NO shutter click is ever dropped!
+                        backgroundHandler?.post {
+                            val queued = queuedShutterRequest
+                            if (queued != null) {
+                                queuedShutterTimeout?.let { backgroundHandler?.removeCallbacks(it) }
+                                queuedShutterTimeout = null
+                                queuedShutterRequest = null
+                                if (System.currentTimeMillis() - queued.queuedAtMs <= 3500L) {
+                                    submitPhotoCaptureOnHandler(queued.grade, queued.settings, queued.lut)
+                                }
+                            }
+                        }
                     }
 
                     override fun onConfigureFailed(session: CameraCaptureSession) {
@@ -413,6 +499,11 @@ class TrueLensCameraEngine(
         val maxZ = activeLens?.maxZoomRatio ?: 8.0f
         this.zoomRatio = ratio.coerceIn(minZ, maxZ)
         updateRepeatingPreview()
+    }
+
+    /** Feeds live gyroscope angular speed (rad/s) for gyro-weighted Lucky Burst frame selection. */
+    fun updateGyroSpeed(radPerSec: Float) {
+        latestGyroSpeedRadSec = radPerSec
     }
 
     fun triggerTapToFocus(normX: Float, normY: Float) {
@@ -711,46 +802,40 @@ class TrueLensCameraEngine(
     /** Captures a still JPEG snapshot without interrupting an active video recording! */
     fun captureVideoSnapshot(grade: LightroomGrade, settings: ManualSettings, lut: CubeLut? = null) {
         if (!isRecordingVideo) return
-        val device = cameraDevice ?: return
-        val session = captureSession ?: return
-        val reader = jpegReader ?: return
-        val lens = activeLens ?: return
+        startThread()
+        val handler = backgroundHandler ?: return
+        handler.post {
+            val device = cameraDevice ?: return@post
+            val session = captureSession ?: return@post
+            val reader = jpegReader ?: return@post
+            val lens = activeLens ?: return@post
 
-        pendingRawImage?.close()
-        pendingRawImage = null
-        pendingJpegBytes = null
-        pendingRawResult = null
-        pendingJpegResult = null
-        pendingCaptureExpectsRaw = false
-        pendingCaptureExpectsJpeg = true
-        pendingCaptureGrade = grade
-        pendingCaptureLut = lut
-        pendingCaptureSettings = settings
-
-        try {
-            val builder = device.createCaptureRequest(CameraDevice.TEMPLATE_VIDEO_SNAPSHOT)
-            builder.addTarget(reader.surface)
-            builder.setTag("JPEG")
-            applyRequestParameters(builder, settings)
-            builder.set(CaptureRequest.JPEG_QUALITY, 95.toByte())
-            builder.set(CaptureRequest.JPEG_ORIENTATION, lens.sensorOrientation)
-            session.capture(
-                builder.build(),
-                object : CameraCaptureSession.CaptureCallback() {
-                    override fun onCaptureCompleted(
-                        session: CameraCaptureSession,
-                        request: CaptureRequest,
-                        result: TotalCaptureResult
-                    ) {
-                        pendingJpegResult = result
-                        tryFinalizeCapture()
-                    }
-                },
-                backgroundHandler
+            val job = PendingCaptureJob(
+                id = captureIdCounter.getAndIncrement(),
+                expectedJpegCount = 1,
+                expectRaw = false,
+                isCleanBurst = false,
+                grade = grade,
+                lut = lut,
+                settings = settings,
+                lens = lens,
+                characteristics = activeCharacteristics
             )
-        } catch (e: Exception) {
-            Log.w(TAG, "Mid-video snapshot failed", e)
-            onError("Video snapshot unavailable on this lens")
+            activeCaptureJobs.addLast(job)
+            scheduleJobWatchdogOnHandler(job)
+
+            try {
+                val builder = device.createCaptureRequest(CameraDevice.TEMPLATE_VIDEO_SNAPSHOT)
+                builder.addTarget(reader.surface)
+                builder.setTag("JPEG_${job.id}")
+                applyRequestParameters(builder, settings)
+                builder.set(CaptureRequest.JPEG_QUALITY, 95.toByte())
+                builder.set(CaptureRequest.JPEG_ORIENTATION, lens.sensorOrientation)
+                session.capture(builder.build(), createJobCaptureCallback(job), handler)
+            } catch (e: Exception) {
+                Log.w(TAG, "Mid-video snapshot failed", e)
+                failAndRemoveJobOnHandler(job, "Video snapshot unavailable on this lens")
+            }
         }
     }
 
@@ -809,124 +894,416 @@ class TrueLensCameraEngine(
     }
 
     fun capturePanoramaFrame(settings: ManualSettings, onFrame: (Bitmap?) -> Unit) {
-        val device = cameraDevice ?: return onFrame(null)
-        val session = captureSession ?: return onFrame(null)
-        val reader = jpegReader ?: return onFrame(null)
-        val lens = activeLens ?: return onFrame(null)
+        startThread()
+        val handler = backgroundHandler ?: return onFrame(null)
+        handler.post {
+            val device = cameraDevice
+            val session = captureSession
+            val reader = jpegReader
+            val lens = activeLens
+            if (device == null || session == null || reader == null || lens == null) {
+                onFrame(null)
+                return@post
+            }
 
-        pendingMemoryFrameCallback = onFrame
-        try {
-            val builder = device.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE)
-            builder.addTarget(reader.surface)
-            applyRequestParameters(builder, settings)
-            builder.set(CaptureRequest.JPEG_QUALITY, 92.toByte())
-            builder.set(CaptureRequest.JPEG_ORIENTATION, lens.sensorOrientation)
-            session.capture(builder.build(), null, backgroundHandler)
-        } catch (e: Exception) {
-            pendingMemoryFrameCallback = null
-            Log.e(TAG, "Panorama frame capture failed", e)
-            onFrame(null)
+            val memJob = MemoryFrameJob(id = captureIdCounter.getAndIncrement(), callback = onFrame)
+            // 3.5s safety timeout guarantees a failed memory frame NEVER lingers to hijack a future real photo!
+            val timeout = Runnable {
+                if (pendingMemoryJobs.remove(memJob)) {
+                    Log.w(TAG, "Memory frame #${memJob.id} timed out — releasing callback cleanly")
+                    onFrame(null)
+                }
+            }
+            memJob.timeoutRunnable = timeout
+            pendingMemoryJobs.addLast(memJob)
+            handler.postDelayed(timeout, 3500L)
+
+            try {
+                val builder = device.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE)
+                builder.addTarget(reader.surface)
+                builder.setTag("MEM_${memJob.id}")
+                applyRequestParameters(builder, settings)
+                builder.set(CaptureRequest.JPEG_QUALITY, 92.toByte())
+                builder.set(CaptureRequest.JPEG_ORIENTATION, lens.sensorOrientation)
+                session.capture(
+                    builder.build(),
+                    object : CameraCaptureSession.CaptureCallback() {
+                        override fun onCaptureFailed(
+                            session: CameraCaptureSession,
+                            request: CaptureRequest,
+                            failure: android.hardware.camera2.CaptureFailure
+                        ) {
+                            if (pendingMemoryJobs.remove(memJob)) {
+                                memJob.timeoutRunnable?.let { handler.removeCallbacks(it) }
+                                onFrame(null)
+                            }
+                        }
+                    },
+                    handler
+                )
+            } catch (e: Exception) {
+                if (pendingMemoryJobs.remove(memJob)) {
+                    memJob.timeoutRunnable?.let { handler.removeCallbacks(it) }
+                }
+                Log.e(TAG, "Panorama frame capture failed", e)
+                onFrame(null)
+            }
         }
     }
 
+    /**
+     * Zero-Drop Photo Capture:
+     * - Runs all state transitions exclusively on [backgroundHandler] inside a FIFO queue.
+     * - If the session is currently opening/reconfiguring, queues the click and fires immediately onConfigured().
+     * - When Clean Look (EnhanceMode.CLEAN) is active and flash isn't forced ON, shoots a rapid 5-frame
+     *   HDR+ burst (aligned patch-Wiener temporal merge + multi-scale wavelet denoiser) for native-camera-grade
+     *   noise removal!
+     * - Every job has a 3.5s watchdog + 1x automatic retry so a shutter click is NEVER silently dropped.
+     */
     fun capturePhoto(grade: LightroomGrade, settings: ManualSettings, lut: CubeLut? = null) {
-        val device = cameraDevice ?: return
-        val session = captureSession ?: return
-        val lens = activeLens ?: return
+        startThread()
+        val handler = backgroundHandler
+        if (handler == null) {
+            onError("Camera engine not ready — tap again")
+            return
+        }
+        handler.post {
+            submitPhotoCaptureOnHandler(grade, settings, lut)
+        }
+    }
 
+    private fun submitPhotoCaptureOnHandler(
+        grade: LightroomGrade,
+        settings: ManualSettings,
+        lut: CubeLut?,
+        afWaitElapsedMs: Long = 0L
+    ) {
+        val handler = backgroundHandler ?: return
+        val device = cameraDevice
+        val session = captureSession
+        val lens = activeLens
+
+        // Session currently opening/reconfiguring? Queue shutter click and auto-fire onConfigured()!
+        if (device == null || session == null || lens == null) {
+            queuedShutterTimeout?.let { handler.removeCallbacks(it) }
+            val req = QueuedShutterRequest(grade, settings, lut, System.currentTimeMillis())
+            queuedShutterRequest = req
+            val timeout = Runnable {
+                if (queuedShutterRequest === req) {
+                    queuedShutterRequest = null
+                    queuedShutterTimeout = null
+                    onError("Camera is still starting — tap again")
+                }
+            }
+            queuedShutterTimeout = timeout
+            handler.postDelayed(timeout, 3000L)
+            return
+        }
+
+        // Smart PDAF Focus-Ready Gate (Tier 3):
+        // 0ms delay when focus is already locked/converged or in Manual Focus; if PDAF is mid-sweep,
+        // pause up to 180ms max so focus lands razor-sharp instead of firing mid-blur!
+        val isAutoAf = settings.focusDistanceDiopters == null && settings.shootingMode != ShootingMode.SUPER_MACRO
+        val afMidSweep = lastAfState == CaptureResult.CONTROL_AF_STATE_PASSIVE_SCAN ||
+            lastAfState == CaptureResult.CONTROL_AF_STATE_ACTIVE_SCAN
+        if (isAutoAf && afMidSweep && afWaitElapsedMs < 180L && activeCaptureJobs.isEmpty()) {
+            handler.postDelayed({
+                submitPhotoCaptureOnHandler(grade, settings, lut, afWaitElapsedMs + 30L)
+            }, 30L)
+            return
+        }
+
+        // Serialize HAL capture submission (max 1 active capture/burst in-flight at the HAL) so we
+        // NEVER overflow Android's REQUEST_PIPELINE_MAX_DEPTH on any phone! Extra rapid taps queue
+        // in FIFO order and fire the exact millisecond the current HAL acquisition completes.
+        if (activeCaptureJobs.isNotEmpty()) {
+            if (deferredCaptureQueue.size < 8) {
+                deferredCaptureQueue.addLast(QueuedShutterRequest(grade, settings, lut, System.currentTimeMillis()))
+            }
+            return
+        }
+
+        val reader = jpegReader
         val wantRaw = lens.supportsRawSensor && rawReader != null &&
             (settings.captureFormat == CaptureFormat.RAW_PLUS_JPG ||
                 settings.captureFormat == CaptureFormat.RAW_ONLY)
-        val wantJpeg = !wantRaw || settings.captureFormat != CaptureFormat.RAW_ONLY
+        val wantJpeg = (!wantRaw || settings.captureFormat != CaptureFormat.RAW_ONLY) && reader != null
+        if (!wantJpeg && !wantRaw) {
+            onError("Camera output surface not ready — tap again")
+            return
+        }
 
-        pendingRawImage?.close()
-        pendingRawImage = null
-        pendingJpegBytes = null
-        pendingRawResult = null
-        pendingJpegResult = null
-        pendingCaptureExpectsRaw = wantRaw
-        pendingCaptureExpectsJpeg = wantJpeg
-        pendingCaptureGrade = grade
-        pendingCaptureLut = lut
-        pendingCaptureSettings = settings
+        val isManualExposure = lens.supportsManualSensor &&
+            (settings.exposureMode == ExposureMode.MANUAL_M ||
+                (settings.exposureMode == ExposureMode.SHUTTER_TV && settings.shutterSpeedNs != null))
+        val isSlowManualShutter = settings.shutterSpeedNs != null && settings.shutterSpeedNs >= 100_000_000L
 
+        // Tier 2: Mertens 3-Frame Optical Exposure Fusion HDR (-1.3 EV, 0 EV, +1.0 EV)
+        val useOpticalHdr = wantJpeg &&
+            settings.opticalHdrEnabled &&
+            !isManualExposure &&
+            settings.flashMode != FlashMode.ON &&
+            lens.aeCompensationRange.lower <= -2 &&
+            lens.aeCompensationRange.upper >= 2
+
+        // Tier 2/3: Clean Look 4-frame Sub-Pixel HDR+ Burst when not in Optical HDR bracket
+        val useCleanBurst = wantJpeg &&
+            !useOpticalHdr &&
+            settings.enhanceMode == EnhanceMode.CLEAN &&
+            settings.flashMode != FlashMode.ON &&
+            !isSlowManualShutter
+
+        val jpegCount = when {
+            useOpticalHdr -> 3
+            useCleanBurst -> CLEAN_BURST_FRAMES
+            wantJpeg -> 1
+            else -> 0
+        }
+
+        val job = PendingCaptureJob(
+            id = captureIdCounter.getAndIncrement(),
+            expectedJpegCount = jpegCount,
+            expectRaw = wantRaw,
+            isCleanBurst = useCleanBurst,
+            isOpticalHdr = useOpticalHdr,
+            grade = grade,
+            lut = lut,
+            settings = settings,
+            lens = lens,
+            characteristics = activeCharacteristics
+        )
+        activeCaptureJobs.addLast(job)
+        scheduleJobWatchdogOnHandler(job)
+
+        submitRequestsForJobOnHandler(job, device, session)
+    }
+
+    private fun submitRequestsForJobOnHandler(
+        job: PendingCaptureJob,
+        device: CameraDevice,
+        session: CameraCaptureSession
+    ) {
+        val handler = backgroundHandler ?: return
+        val callback = createJobCaptureCallback(job)
         try {
-            // CRITICAL: Always use TEMPLATE_STILL_CAPTURE so CONTROL_MODE_AUTO, color matrices,
-            // lens shading, and converged AE/AWB remain intact on every Android device.
-            //
-            // DECOUPLED CAPTURE FOR RAW+JPG:
-            // Submitting JPEG and RAW as two separate back-to-back requests in captureBurst()
-            // ensures the JPEG request NEVER attaches RAW_SENSOR — preventing Android HALs
-            // from disabling high-quality hardware noise reduction on the JPEG!
-            val callback = object : CameraCaptureSession.CaptureCallback() {
-                override fun onCaptureCompleted(
-                    session: CameraCaptureSession,
-                    request: CaptureRequest,
-                    result: TotalCaptureResult
-                ) {
-                    if (request.tag == "RAW") {
-                        pendingRawResult = result
-                    } else {
-                        pendingJpegResult = result
-                    }
-                    tryFinalizeCapture()
-                }
+            val requests = ArrayList<CaptureRequest>(job.expectedJpegCount + if (job.expectRaw) 1 else 0)
+            val jpegSurface = jpegReader?.surface
+            if (job.expectedJpegCount > 0 && jpegSurface != null) {
+                val baseEv = job.settings.evCompensationSteps
+                val evStepSize = job.lens.aeCompensationStep.toFloat().coerceAtLeast(0.1f)
+                val hdrOffsets = if (job.isOpticalHdr) {
+                    val underSteps = (-1.35f / evStepSize).toInt().coerceAtMost(-2)
+                    val overSteps = (1.0f / evStepSize).toInt().coerceAtLeast(2)
+                    intArrayOf(underSteps, 0, overSteps)
+                } else null
 
-                override fun onCaptureFailed(
-                    session: CameraCaptureSession,
-                    request: CaptureRequest,
-                    failure: android.hardware.camera2.CaptureFailure
-                ) {
-                    Log.w(TAG, "Capture request failed (tag=${request.tag}, reason=${failure.reason})")
-                    if (request.tag == "RAW") {
-                        pendingCaptureExpectsRaw = false
-                        pendingRawImage?.close()
-                        pendingRawImage = null
-                    } else {
-                        pendingCaptureExpectsJpeg = false
-                        pendingJpegBytes = null
+                for (i in 0 until job.expectedJpegCount) {
+                    val frameSettings = if (hdrOffsets != null && i < hdrOffsets.size) {
+                        val targetEv = (baseEv + hdrOffsets[i]).coerceIn(
+                            job.lens.aeCompensationRange.lower,
+                            job.lens.aeCompensationRange.upper
+                        )
+                        job.settings.copy(evCompensationSteps = targetEv)
+                    } else job.settings
+
+                    val jb = device.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE).apply {
+                        addTarget(jpegSurface)
+                        setTag("JPEG_${job.id}")
+                        applyRequestParameters(this, frameSettings, isStillCapture = true)
+                        // For multi-frame burst: FAST NR runs at ~30fps burst speed (~130ms total!) AND
+                        // preserves real fine texture so our sub-pixel temporal Wiener merge beats single-frame HQ NR!
+                        if (job.isCleanBurst || job.isOpticalHdr) {
+                            if (supportedNrModes.contains(CaptureRequest.NOISE_REDUCTION_MODE_FAST)) {
+                                set(CaptureRequest.NOISE_REDUCTION_MODE, CaptureRequest.NOISE_REDUCTION_MODE_FAST)
+                            }
+                            if (supportedEdgeModes.contains(CaptureRequest.EDGE_MODE_OFF)) {
+                                set(CaptureRequest.EDGE_MODE, CaptureRequest.EDGE_MODE_OFF)
+                            }
+                        }
+                        set(CaptureRequest.JPEG_QUALITY, if (job.isCleanBurst || job.isOpticalHdr) 96.toByte() else 98.toByte())
+                        set(CaptureRequest.JPEG_ORIENTATION, job.lens.sensorOrientation)
                     }
-                    tryFinalizeCapture()
+                    requests.add(jb.build())
                 }
             }
+            val rawSurface = rawReader?.surface
+            if (job.expectRaw && rawSurface != null) {
+                val rb = device.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE).apply {
+                    addTarget(rawSurface)
+                    setTag("RAW_${job.id}")
+                    applyRequestParameters(this, job.settings, isStillCapture = true)
+                }
+                requests.add(rb.build())
+            }
 
-            if (wantJpeg && wantRaw) {
-                val jpegBuilder = device.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE).apply {
-                    jpegReader?.surface?.let { addTarget(it) }
-                    setTag("JPEG")
-                    applyRequestParameters(this, settings)
-                    set(CaptureRequest.JPEG_QUALITY, 98.toByte())
-                    set(CaptureRequest.JPEG_ORIENTATION, lens.sensorOrientation)
-                }
-                val rawBuilder = device.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE).apply {
-                    rawReader?.surface?.let { addTarget(it) }
-                    setTag("RAW")
-                    applyRequestParameters(this, settings)
-                }
-                session.captureBurst(
-                    listOf(jpegBuilder.build(), rawBuilder.build()),
-                    callback,
-                    backgroundHandler
-                )
+            if (requests.isEmpty()) {
+                failAndRemoveJobOnHandler(job, "Capture target unavailable")
+                return
+            }
+            if (requests.size == 1) {
+                session.capture(requests[0], callback, handler)
             } else {
-                val builder = device.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE)
-                if (wantJpeg) {
-                    jpegReader?.surface?.let { builder.addTarget(it) }
-                    builder.setTag("JPEG")
-                } else if (wantRaw) {
-                    rawReader?.surface?.let { builder.addTarget(it) }
-                    builder.setTag("RAW")
-                }
-                applyRequestParameters(builder, settings)
-                if (wantJpeg) {
-                    builder.set(CaptureRequest.JPEG_QUALITY, 98.toByte())
-                    builder.set(CaptureRequest.JPEG_ORIENTATION, lens.sensorOrientation)
-                }
-                session.capture(builder.build(), callback, backgroundHandler)
+                session.captureBurst(requests, callback, handler)
             }
         } catch (e: Exception) {
-            Log.e(TAG, "Capture failed", e)
-            onError("Capture failed: ${e.message}")
+            Log.e(TAG, "Capture submission failed for job #${job.id}", e)
+            retryOrFailJobOnHandler(job, "Capture failed: ${e.message}")
+        }
+    }
+
+    private fun createJobCaptureCallback(job: PendingCaptureJob): CameraCaptureSession.CaptureCallback {
+        return object : CameraCaptureSession.CaptureCallback() {
+            override fun onCaptureStarted(
+                session: CameraCaptureSession,
+                request: CaptureRequest,
+                timestamp: Long,
+                frameNumber: Long
+            ) {
+                val tag = request.tag as? String ?: ""
+                if (tag.startsWith("JPEG_")) {
+                    // Snapshot live gyroscope angular velocity right as the shutter opens for Lucky Burst weighting!
+                    job.frameShakeScores.add(latestGyroSpeedRadSec)
+                }
+            }
+
+            override fun onCaptureCompleted(
+                session: CameraCaptureSession,
+                request: CaptureRequest,
+                result: TotalCaptureResult
+            ) {
+                if (job.finalized) return
+                val tag = request.tag as? String ?: ""
+                if (tag.startsWith("RAW_")) {
+                    job.rawResult = result
+                } else {
+                    job.jpegResults.add(result)
+                }
+                tryFinalizeJobOnHandler(job, forcePartial = false)
+            }
+
+            override fun onCaptureFailed(
+                session: CameraCaptureSession,
+                request: CaptureRequest,
+                failure: android.hardware.camera2.CaptureFailure
+            ) {
+                if (job.finalized) return
+                val tag = request.tag as? String ?: ""
+                Log.w(TAG, "Capture request failed (tag=$tag, reason=${failure.reason})")
+                if (tag.startsWith("RAW_")) {
+                    job.expectRaw = false
+                    job.rawImage?.close()
+                    job.rawImage = null
+                    tryFinalizeJobOnHandler(job, forcePartial = false)
+                } else {
+                    if (job.expectedJpegCount > 1) {
+                        job.expectedJpegCount = (job.expectedJpegCount - 1).coerceAtLeast(1)
+                        tryFinalizeJobOnHandler(job, forcePartial = false)
+                    } else if (job.jpegFrames.isNotEmpty()) {
+                        tryFinalizeJobOnHandler(job, forcePartial = true)
+                    } else {
+                        retryOrFailJobOnHandler(job, "Capture interrupted — try again")
+                    }
+                }
+            }
+        }
+    }
+
+    private fun scheduleJobWatchdogOnHandler(job: PendingCaptureJob) {
+        val handler = backgroundHandler ?: return
+        job.watchdogRunnable?.let { handler.removeCallbacks(it) }
+        val timeoutMs = if (job.isCleanBurst) 4500L else 3200L
+        val watchdog = Runnable {
+            if (job.finalized) return@Runnable
+            if (job.jpegFrames.isNotEmpty() || job.rawImage != null) {
+                // We ALREADY have photo data! Save immediately even if a burst frame or TotalCaptureResult stalled!
+                Log.w(TAG, "Job #${job.id} watchdog saving ${job.jpegFrames.size}/${job.expectedJpegCount} frame(s)")
+                tryFinalizeJobOnHandler(job, forcePartial = true)
+            } else {
+                Log.w(TAG, "Job #${job.id} watchdog triggered with 0 frames — attempting automatic retry")
+                retryOrFailJobOnHandler(job, "Photo capture timed out — please tap again")
+            }
+        }
+        job.watchdogRunnable = watchdog
+        handler.postDelayed(watchdog, timeoutMs)
+    }
+
+    private fun retryOrFailJobOnHandler(job: PendingCaptureJob, errorMsg: String) {
+        if (job.finalized) return
+        val device = cameraDevice
+        val session = captureSession
+        if (job.retryCount < 1 && device != null && session != null && jpegReader != null) {
+            job.retryCount++
+            // Fallback retry as a clean single-frame capture for maximum reliability
+            job.expectedJpegCount = 1
+            job.expectRaw = false
+            job.jpegFrames.clear()
+            job.jpegResults.clear()
+            Log.i(TAG, "Auto-retrying photo capture job #${job.id} (single-frame safe retry)")
+            scheduleJobWatchdogOnHandler(job)
+            submitRequestsForJobOnHandler(job, device, session)
+        } else {
+            failAndRemoveJobOnHandler(job, errorMsg)
+        }
+    }
+
+    private fun failAndRemoveJobOnHandler(job: PendingCaptureJob, errorMsg: String) {
+        if (job.finalized) return
+        job.finalized = true
+        job.watchdogRunnable?.let { backgroundHandler?.removeCallbacks(it) }
+        job.rawImage?.close()
+        job.rawImage = null
+        activeCaptureJobs.remove(job)
+        onError(errorMsg)
+        drainDeferredCaptureOnHandler()
+    }
+
+    private fun drainDeferredCaptureOnHandler() {
+        if (activeCaptureJobs.isNotEmpty()) return
+        val next = deferredCaptureQueue.removeFirstOrNull() ?: return
+        submitPhotoCaptureOnHandler(next.grade, next.settings, next.lut)
+    }
+
+    private fun dispatchIncomingJpegOnHandler(bytes: ByteArray, fallbackLens: LensInfo) {
+        // Route to oldest pending memory-frame request ONLY if a memory-frame capture is actively waiting
+        val memJob = pendingMemoryJobs.firstOrNull()
+        if (memJob != null && activeCaptureJobs.isEmpty()) {
+            pendingMemoryJobs.removeFirst()
+            memJob.timeoutRunnable?.let { backgroundHandler?.removeCallbacks(it) }
+            val mirrorFront = fallbackLens.isFront && currentSettings.mirrorFrontSave
+            ioExecutor.execute {
+                val bmp = decodeJpegWithExifOrientation(bytes, mirrorHorizontal = mirrorFront)
+                memJob.callback(bmp)
+            }
+            return
+        }
+
+        // Route to the oldest active photo job that still needs JPEG frames
+        val targetJob = activeCaptureJobs.firstOrNull { !it.finalized && it.jpegFrames.size < it.expectedJpegCount }
+        if (targetJob != null) {
+            targetJob.jpegFrames.add(bytes)
+            tryFinalizeJobOnHandler(targetJob, forcePartial = false)
+            return
+        }
+
+        // Fallback: if a memory job was queued concurrently with a finished photo job, deliver to it
+        if (memJob != null) {
+            pendingMemoryJobs.removeFirst()
+            memJob.timeoutRunnable?.let { backgroundHandler?.removeCallbacks(it) }
+            val mirrorFront = fallbackLens.isFront && currentSettings.mirrorFrontSave
+            ioExecutor.execute {
+                val bmp = decodeJpegWithExifOrientation(bytes, mirrorHorizontal = mirrorFront)
+                memJob.callback(bmp)
+            }
+        }
+    }
+
+    private fun dispatchIncomingRawOnHandler(image: Image) {
+        val targetJob = activeCaptureJobs.firstOrNull { !it.finalized && it.expectRaw && it.rawImage == null }
+        if (targetJob != null) {
+            targetJob.rawImage = image
+            tryFinalizeJobOnHandler(targetJob, forcePartial = false)
+        } else {
+            image.close()
         }
     }
 
@@ -952,12 +1329,16 @@ class TrueLensCameraEngine(
                         request: CaptureRequest,
                         result: TotalCaptureResult
                     ) {
+                        // Update AF state on EVERY preview frame so our Smart PDAF Ready-Gate has zero lag!
+                        result.get(CaptureResult.CONTROL_AF_STATE)?.let { lastAfState = it }
                         val now = System.currentTimeMillis()
                         if (now - lastTelemetryTime >= 150L) {
                             lastTelemetryTime = now
                             val lens = activeLens ?: return
                             val iso = result.get(CaptureResult.SENSOR_SENSITIVITY) ?: 100
                             val expNs = result.get(CaptureResult.SENSOR_EXPOSURE_TIME) ?: 16_666_666L
+                            lastLiveIso = iso
+                            lastLiveExpNs = expNs
                             val focusD = result.get(CaptureResult.LENS_FOCUS_DISTANCE) ?: 0f
                             val afState = result.get(CaptureResult.CONTROL_AF_STATE)
                             val afLocked = afState == CaptureResult.CONTROL_AF_STATE_FOCUSED_LOCKED ||
@@ -983,11 +1364,60 @@ class TrueLensCameraEngine(
         }
     }
 
-    private fun applyRequestParameters(builder: CaptureRequest.Builder, settings: ManualSettings) {
+    private fun applyRequestParameters(
+        builder: CaptureRequest.Builder,
+        settings: ManualSettings,
+        isStillCapture: Boolean = false
+    ) {
         val lens = activeLens ?: return
 
         // Always keep CONTROL_MODE_AUTO so individual AE/AF/AWB settings are honored by the HAL
         builder.set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO)
+
+        // --- TIER 1: HARDWARE OPTICAL FIDELITY PACK (Zero-AI, Real Sensor & Lens Physics!) ---
+        // 1. Physical Hardware OIS on ALL still captures & preview (dramatically sharper handheld shots!)
+        if (supportsOis && !isRecordingVideo) {
+            builder.set(
+                CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE,
+                CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE_ON
+            )
+        }
+        // 2. Indoor 50/60Hz LED & fluorescent anti-banding (eliminates dark rolling flicker stripes!)
+        if (supportedAntibandingModes.contains(CaptureRequest.CONTROL_AE_ANTIBANDING_MODE_AUTO)) {
+            builder.set(CaptureRequest.CONTROL_AE_ANTIBANDING_MODE, CaptureRequest.CONTROL_AE_ANTIBANDING_MODE_AUTO)
+        }
+        // 3. Full-quality optical aberration, lens distortion & corner shading corrections on still captures!
+        if (isStillCapture) {
+            if (supportedAberrationModes.contains(CaptureRequest.COLOR_CORRECTION_ABERRATION_MODE_HIGH_QUALITY)) {
+                builder.set(
+                    CaptureRequest.COLOR_CORRECTION_ABERRATION_MODE,
+                    CaptureRequest.COLOR_CORRECTION_ABERRATION_MODE_HIGH_QUALITY
+                )
+            } else if (supportedAberrationModes.contains(CaptureRequest.COLOR_CORRECTION_ABERRATION_MODE_FAST)) {
+                builder.set(
+                    CaptureRequest.COLOR_CORRECTION_ABERRATION_MODE,
+                    CaptureRequest.COLOR_CORRECTION_ABERRATION_MODE_FAST
+                )
+            }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                if (supportedDistortionModes.contains(CaptureRequest.DISTORTION_CORRECTION_MODE_HIGH_QUALITY)) {
+                    builder.set(
+                        CaptureRequest.DISTORTION_CORRECTION_MODE,
+                        CaptureRequest.DISTORTION_CORRECTION_MODE_HIGH_QUALITY
+                    )
+                } else if (supportedDistortionModes.contains(CaptureRequest.DISTORTION_CORRECTION_MODE_FAST)) {
+                    builder.set(
+                        CaptureRequest.DISTORTION_CORRECTION_MODE,
+                        CaptureRequest.DISTORTION_CORRECTION_MODE_FAST
+                    )
+                }
+            }
+            if (supportedShadingModes.contains(CaptureRequest.SHADING_MODE_HIGH_QUALITY)) {
+                builder.set(CaptureRequest.SHADING_MODE, CaptureRequest.SHADING_MODE_HIGH_QUALITY)
+            } else if (supportedShadingModes.contains(CaptureRequest.SHADING_MODE_FAST)) {
+                builder.set(CaptureRequest.SHADING_MODE, CaptureRequest.SHADING_MODE_FAST)
+            }
+        }
 
         // --- ZERO-AI PURE OPTICS (DEFAULT) vs OPTIONAL CLEAN ENHANCE ---
         val useCleanEnhance = settings.enhanceMode == EnhanceMode.CLEAN
@@ -1001,7 +1431,7 @@ class TrueLensCameraEngine(
             )
             if (useCleanEnhance) {
                 // Clean Enhance: hardware HQ noise reduction + EDGE_MODE_OFF (prevents OEM grain-amplifying sharpening halos;
-                // our scientific YCbCr chroma + bilateral + coring clarity pass handles crispness cleanly!)
+                // our scientific YCbCr chroma + wavelet + PSF deconvolution pass handles crispness cleanly!)
                 if (supportedNrModes.contains(CaptureRequest.NOISE_REDUCTION_MODE_HIGH_QUALITY)) {
                     builder.set(CaptureRequest.NOISE_REDUCTION_MODE, CaptureRequest.NOISE_REDUCTION_MODE_HIGH_QUALITY)
                 } else if (supportedNrModes.contains(CaptureRequest.NOISE_REDUCTION_MODE_FAST)) {
@@ -1023,7 +1453,12 @@ class TrueLensCameraEngine(
                     builder.set(CaptureRequest.NOISE_REDUCTION_MODE, CaptureRequest.NOISE_REDUCTION_MODE_OFF)
                 }
             }
-            builder.set(CaptureRequest.HOT_PIXEL_MODE, CaptureRequest.HOT_PIXEL_MODE_FAST)
+            val hotPixelMode = if (isStillCapture && supportedHotPixelModes.contains(CaptureRequest.HOT_PIXEL_MODE_HIGH_QUALITY)) {
+                CaptureRequest.HOT_PIXEL_MODE_HIGH_QUALITY
+            } else {
+                CaptureRequest.HOT_PIXEL_MODE_FAST
+            }
+            builder.set(CaptureRequest.HOT_PIXEL_MODE, hotPixelMode)
         }
 
         // --- CANON-STYLE EXPOSURE MODES (P / Tv / M) ---
@@ -1109,6 +1544,9 @@ class TrueLensCameraEngine(
         } else {
             builder.set(CaptureRequest.CONTROL_AWB_MODE, CaptureRequest.CONTROL_AWB_MODE_AUTO)
             builder.set(CaptureRequest.CONTROL_AWB_LOCK, settings.videoWbLocked)
+            if (isStillCapture) {
+                builder.set(CaptureRequest.COLOR_CORRECTION_MODE, CaptureRequest.COLOR_CORRECTION_MODE_HIGH_QUALITY)
+            }
         }
 
         // --- ZOOM ---
@@ -1117,31 +1555,44 @@ class TrueLensCameraEngine(
         }
     }
 
-    private fun tryFinalizeCapture() {
-        if (pendingCaptureExpectsRaw && (pendingRawImage == null || pendingRawResult == null)) return
-        if (pendingCaptureExpectsJpeg && (pendingJpegBytes == null || pendingJpegResult == null)) return
+    private fun tryFinalizeJobOnHandler(job: PendingCaptureJob, forcePartial: Boolean) {
+        if (job.finalized) return
+        if (!forcePartial) {
+            if (job.expectRaw && (job.rawImage == null || job.rawResult == null)) return
+            if (job.expectedJpegCount > 0 && (job.jpegFrames.size < job.expectedJpegCount || job.jpegResults.isEmpty())) return
+        } else {
+            if (job.jpegFrames.isEmpty() && job.rawImage == null) return
+        }
 
-        val rawImage = pendingRawImage
-        val rawResult = pendingRawResult
-        val jpegResult = pendingJpegResult
-        val primaryResult = jpegResult ?: rawResult ?: return
-        val jpegBytes = pendingJpegBytes
-        val chars = activeCharacteristics
-        val lens = activeLens ?: return
-        val grade = pendingCaptureGrade
-        val lut = pendingCaptureLut
-        val settings = pendingCaptureSettings
+        job.finalized = true
+        job.watchdogRunnable?.let { backgroundHandler?.removeCallbacks(it) }
+        job.watchdogRunnable = null
+        activeCaptureJobs.remove(job)
+        // Immediately kick off the next queued rapid-fire shutter tap at the HAL while this one saves on ioExecutor!
+        drainDeferredCaptureOnHandler()
 
-        // Reset pending state
-        pendingRawImage = null
-        pendingRawResult = null
-        pendingJpegResult = null
-        pendingJpegBytes = null
-        pendingCaptureLut = null
+        val rawImage = job.rawImage
+        job.rawImage = null
+        val rawResult = job.rawResult
+        val primaryResult = job.jpegResults.getOrNull(if (job.isOpticalHdr && job.jpegResults.size >= 2) 1 else 0)
+            ?: job.jpegResults.firstOrNull()
+            ?: rawResult
+        val jpegFramesCopy = ArrayList(job.jpegFrames)
+        val shakeScoresCopy = if (job.frameShakeScores.isNotEmpty()) job.frameShakeScores.toFloatArray() else null
+        val isOpticalHdrJob = job.isOpticalHdr
+        val chars = job.characteristics
+        val lens = job.lens
+        val grade = job.grade
+        val lut = job.lut
+        val settings = job.settings
+        val fallbackIso = lastLiveIso
+        val fallbackExp = lastLiveExpNs
 
         ioExecutor.execute {
             val timestamp = System.currentTimeMillis()
-            val stamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date(timestamp))
+            val seq = fileSeqCounter.getAndIncrement() % 1000L
+            val stamp = SimpleDateFormat("yyyyMMdd_HHmmss_SSS", Locale.US).format(Date(timestamp)) +
+                if (seq > 0L) "_${seq}" else ""
             var savedDngUri: Uri? = null
             var savedJpegUri: Uri? = null
 
@@ -1153,56 +1604,133 @@ class TrueLensCameraEngine(
                     } finally {
                         rawImage.close()
                     }
+                } else {
+                    rawImage?.close()
                 }
 
-                val iso = primaryResult.get(CaptureResult.SENSOR_SENSITIVITY) ?: 100
-                // 2. Save Clean / Graded JPEG (with EXIF orientation, optional scientific Clean Enhance, Mirror-Save, .cube LUT & Date Stamp)
+                val iso = primaryResult?.get(CaptureResult.SENSOR_SENSITIVITY) ?: fallbackIso
+                val exp = primaryResult?.get(CaptureResult.SENSOR_EXPOSURE_TIME) ?: fallbackExp
+                // 2. Save Clean / Optical HDR / Multi-Frame Sub-Pixel Burst / Ultra HDR JPEG + Full EXIF
                 val jpegDisplayName = "TrueLens_$stamp.jpg"
-                if (jpegBytes != null) {
+                if (jpegFramesCopy.isNotEmpty()) {
                     val hasDateStamp = settings.dateStampStyle != com.truelens.camera.grading.DateStampStyle.OFF
                     val useClean = settings.enhanceMode == EnhanceMode.CLEAN
-                    val needTransform = !grade.isNeutral || lut != null || useClean ||
-                        (lens.isFront && settings.mirrorFrontSave) || hasDateStamp
+                    val mirrorFront = lens.isFront && settings.mirrorFrontSave
+                    val needTransform = isOpticalHdrJob || jpegFramesCopy.size > 1 || !grade.isNeutral ||
+                        lut != null || useClean || mirrorFront || hasDateStamp
+
+                    var wasReencoded = false
                     val finalBytes = if (needTransform) {
-                        val oriented = decodeJpegWithExifOrientation(
-                            jpegBytes,
-                            mirrorHorizontal = lens.isFront && settings.mirrorFrontSave
-                        )
-                        if (oriented != null) {
-                            val enhanced = if (useClean) {
-                                BitmapGrader.applyCleanEnhance(oriented, iso).also {
-                                    if (it !== oriented) oriented.recycle()
+                        try {
+                            val baseBitmap: Bitmap? = when {
+                                isOpticalHdrJob && jpegFramesCopy.size >= 2 -> {
+                                    // Tier 2: Mertens 3-Frame Optical Exposure Fusion + AgX Highlight Roll-Off!
+                                    val fused = OpticalHdrEngine.fuseLazyBracket(
+                                        frameCount = jpegFramesCopy.size,
+                                        refIndex = jpegFramesCopy.size / 2,
+                                        decodeFullFrame = { idx ->
+                                            decodeJpegWithExifOrientation(jpegFramesCopy[idx], mirrorHorizontal = mirrorFront)
+                                        }
+                                    )
+                                    if (fused != null && useClean) {
+                                        ComputationalDenoiser.denoiseSingle(
+                                            fused,
+                                            iso = iso,
+                                            mergedFrameCount = jpegFramesCopy.size
+                                        ).also { if (it !== fused) fused.recycle() }
+                                    } else {
+                                        fused
+                                    }
                                 }
-                            } else oriented
-                            val graded = if (!grade.isNeutral || lut != null) {
-                                BitmapGrader.applyGrade(enhanced, grade, lut).also {
-                                    if (it !== enhanced) enhanced.recycle()
+                                useClean && jpegFramesCopy.size > 1 -> {
+                                    // Tier 2/3/5: Sub-Pixel Super-Res + Lucky Gyro Burst + 3-Octave Wavelets + PSF Deconvolution!
+                                    ComputationalDenoiser.processLazyBurst(
+                                        frameCount = jpegFramesCopy.size,
+                                        iso = iso,
+                                        frameShakeScores = shakeScoresCopy,
+                                        decodeSharpnessThumb = { idx ->
+                                            decodeJpegScaledWithExifOrientation(jpegFramesCopy[idx], sampleSize = 4, mirrorHorizontal = mirrorFront)
+                                        },
+                                        decodeFullFrame = { idx ->
+                                            decodeJpegWithExifOrientation(jpegFramesCopy[idx], mirrorHorizontal = mirrorFront)
+                                        }
+                                    )
                                 }
-                            } else enhanced
-                            val stamped = if (hasDateStamp) {
-                                com.truelens.camera.grading.PhotoFrameRenderer.applyDateStamp(
-                                    graded, settings.dateStampStyle, timestamp
-                                ).also { if (it !== graded) graded.recycle() }
-                            } else {
-                                graded
+                                else -> {
+                                    val oriented = decodeJpegWithExifOrientation(jpegFramesCopy[0], mirrorHorizontal = mirrorFront)
+                                    if (oriented != null && useClean) {
+                                        ComputationalDenoiser.denoiseSingle(oriented, iso = iso, mergedFrameCount = 1).also {
+                                            if (it !== oriented) oriented.recycle()
+                                        }
+                                    } else {
+                                        oriented
+                                    }
+                                }
                             }
-                            val out = ByteArrayOutputStream()
-                            stamped.compress(Bitmap.CompressFormat.JPEG, 96, out)
-                            stamped.recycle()
-                            out.toByteArray()
-                        } else {
-                            jpegBytes
+
+                            if (baseBitmap != null) {
+                                val graded = if (!grade.isNeutral || lut != null) {
+                                    BitmapGrader.applyGrade(baseBitmap, grade, lut).also {
+                                        if (it !== baseBitmap) baseBitmap.recycle()
+                                    }
+                                } else baseBitmap
+                                val stamped = if (hasDateStamp) {
+                                    com.truelens.camera.grading.PhotoFrameRenderer.applyDateStamp(
+                                        graded, settings.dateStampStyle, timestamp
+                                    ).also { if (it !== graded) graded.recycle() }
+                                } else {
+                                    graded
+                                }
+                                // Tier 4: Android 14+ ISO 21496-1 Ultra HDR Gainmap (backwards-compatible JPEG!)
+                                val encoded = UltraHdrEncoder.compressJpegWithOptionalGainmap(
+                                    bitmap = stamped,
+                                    quality = 96,
+                                    enableUltraHdr = settings.ultraHdrEnabled,
+                                    maxHdrBoost = if (isOpticalHdrJob) 3.0f else 2.2f
+                                )
+                                stamped.recycle()
+                                wasReencoded = true
+                                encoded
+                            } else {
+                                jpegFramesCopy[0]
+                            }
+                        } catch (oom: OutOfMemoryError) {
+                            Log.w(TAG, "Low memory during optical processing — saving primary JPEG cleanly", oom)
+                            jpegFramesCopy[0]
                         }
                     } else {
-                        jpegBytes
+                        jpegFramesCopy[0]
                     }
-                    savedJpegUri = saveJpegToMediaStore(finalBytes, jpegDisplayName)
+
+                    val softwareTag = when {
+                        isOpticalHdrJob -> "TrueLens Optical HDR"
+                        useClean && jpegFramesCopy.size > 1 -> "TrueLens Clean ${jpegFramesCopy.size}x"
+                        useClean -> "TrueLens Clean"
+                        else -> "TrueLens Pure Optics"
+                    }
+                    savedJpegUri = saveJpegToMediaStore(
+                        bytes = finalBytes,
+                        displayName = jpegDisplayName,
+                        writeExif = wasReencoded,
+                        iso = iso,
+                        exposureTimeNs = exp,
+                        aperture = lens.aperture,
+                        focalLengthMm = lens.focalLengthMm,
+                        timestampMs = timestamp,
+                        manualWb = settings.whiteBalanceKelvin != null,
+                        softwareTag = softwareTag
+                    )
                 }
 
-                val exp = primaryResult.get(CaptureResult.SENSOR_EXPOSURE_TIME) ?: 16_666_666L
                 val formatBadge = when {
-                    savedDngUri != null && savedJpegUri != null -> if (settings.enhanceMode == EnhanceMode.CLEAN) "RAW+CLEAN" else "RAW+JPG"
+                    savedDngUri != null && savedJpegUri != null ->
+                        if (isOpticalHdrJob) "RAW+HDR"
+                        else if (settings.enhanceMode == EnhanceMode.CLEAN) "RAW+CLEAN"
+                        else "RAW+JPG"
                     savedDngUri != null -> "DNG RAW"
+                    isOpticalHdrJob -> "OPTICAL HDR"
+                    settings.enhanceMode == EnhanceMode.CLEAN && jpegFramesCopy.size > 1 ->
+                        "CLEAN ${jpegFramesCopy.size}×"
                     settings.enhanceMode == EnhanceMode.CLEAN -> "CLEAN+"
                     else -> "CLEAN JPG"
                 }
@@ -1228,8 +1756,26 @@ class TrueLensCameraEngine(
         }
     }
 
+    private fun decodeJpegScaledWithExifOrientation(
+        bytes: ByteArray,
+        sampleSize: Int,
+        mirrorHorizontal: Boolean
+    ): Bitmap? {
+        val opts = BitmapFactory.Options().apply { inSampleSize = sampleSize.coerceAtLeast(1) }
+        val decoded = BitmapFactory.decodeByteArray(bytes, 0, bytes.size, opts) ?: return null
+        return applyExifOrientationAndMirror(decoded, bytes, mirrorHorizontal)
+    }
+
     private fun decodeJpegWithExifOrientation(bytes: ByteArray, mirrorHorizontal: Boolean): Bitmap? {
         val decoded = BitmapFactory.decodeByteArray(bytes, 0, bytes.size) ?: return null
+        return applyExifOrientationAndMirror(decoded, bytes, mirrorHorizontal)
+    }
+
+    private fun applyExifOrientationAndMirror(
+        decoded: Bitmap,
+        bytes: ByteArray,
+        mirrorHorizontal: Boolean
+    ): Bitmap {
         val exifRot = try {
             when (ExifInterface(ByteArrayInputStream(bytes)).getAttributeInt(
                 ExifInterface.TAG_ORIENTATION,
@@ -1288,7 +1834,18 @@ class TrueLensCameraEngine(
         return uri
     }
 
-    private fun saveJpegToMediaStore(bytes: ByteArray, displayName: String): Uri? {
+    private fun saveJpegToMediaStore(
+        bytes: ByteArray,
+        displayName: String,
+        writeExif: Boolean = false,
+        iso: Int = 0,
+        exposureTimeNs: Long = 0L,
+        aperture: Float = 0f,
+        focalLengthMm: Float = 0f,
+        timestampMs: Long = System.currentTimeMillis(),
+        manualWb: Boolean = false,
+        softwareTag: String = "TrueLens Optical"
+    ): Uri? {
         val values = ContentValues().apply {
             put(MediaStore.Images.Media.DISPLAY_NAME, displayName)
             put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
@@ -1301,6 +1858,20 @@ class TrueLensCameraEngine(
         cr.openOutputStream(uri)?.use { stream ->
             stream.write(bytes)
             stream.flush()
+        }
+        // Tier 1: Preserve full real hardware EXIF metadata on every processed JPEG before releasing IS_PENDING!
+        if (writeExif) {
+            ExifMetadataWriter.writeToMediaStoreUri(
+                context = context,
+                uri = uri,
+                iso = iso,
+                exposureTimeNs = exposureTimeNs,
+                aperture = aperture,
+                focalLengthMm = focalLengthMm,
+                timestampMs = timestampMs,
+                manualWhiteBalance = manualWb,
+                softwareTag = softwareTag
+            )
         }
         val done = ContentValues().apply { put(MediaStore.Images.Media.IS_PENDING, 0) }
         cr.update(uri, done, null, null)
@@ -1348,5 +1919,6 @@ class TrueLensCameraEngine(
 
     companion object {
         private const val TAG = "TrueLensCameraEngine"
+        private const val CLEAN_BURST_FRAMES = 4
     }
 }

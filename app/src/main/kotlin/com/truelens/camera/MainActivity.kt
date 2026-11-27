@@ -2,6 +2,7 @@ package com.truelens.camera
 
 import android.Manifest
 import android.content.Intent
+import android.content.pm.ActivityInfo
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
@@ -53,6 +54,15 @@ class MainActivity : ComponentActivity() {
             statusBarStyle = SystemBarStyle.dark(android.graphics.Color.TRANSPARENT),
             navigationBarStyle = SystemBarStyle.dark(android.graphics.Color.TRANSPARENT)
         )
+        // Tier 4: Enable Display P3 Wide Color Gamut & Android 14+ Ultra HDR OLED highlight rendering!
+        try {
+            window.colorMode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                ActivityInfo.COLOR_MODE_HDR
+            } else {
+                ActivityInfo.COLOR_MODE_WIDE_COLOR_GAMUT
+            }
+        } catch (_: Exception) {
+        }
 
         handleIncomingIntent(intent)
 

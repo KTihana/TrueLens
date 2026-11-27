@@ -181,6 +181,8 @@ fun CameraScreen(
 
     if (state.isGalleryOpen) {
         GalleryScreen(
+            initialVideoUri = state.initialGalleryVideoUri,
+            onConsumedInitialVideo = { viewModel.clearInitialGalleryVideo() },
             onClose = { viewModel.closeGallery() },
             onSelectPhotoForDarkroom = { uri, _ -> viewModel.openDarkroomForUri(uri) },
             onMediaDeleted = { viewModel.refreshLatestThumbnail() }
@@ -250,7 +252,9 @@ fun CameraScreen(
         state.settings.stabilizerMode == StabilizerMode.SUPER_STEADY
     val needAccelLevel = state.settings.levelGauge || state.settings.shootingMode == ShootingMode.SCAN_DOC
     val needGyroStability = state.settings.shootingMode == ShootingMode.ASTRO ||
-        state.settings.shootingMode == ShootingMode.LONG_EXP
+        state.settings.shootingMode == ShootingMode.LONG_EXP ||
+        state.settings.enhanceMode == com.truelens.camera.camera.EnhanceMode.CLEAN ||
+        state.settings.opticalHdrEnabled
     val astroRed = state.settings.astroRedUiEnabled
     val hudAccent = if (astroRed) Color(0xFFDC2626) else TrueLensPalette.AccentViolet
 
@@ -1493,7 +1497,9 @@ fun CameraScreen(
                             onToggleShutterSound = { viewModel.toggleShutterSound() },
                             onToggleFloatingShutter = { viewModel.toggleFloatingShutter() },
                             onToggleAudioMeter = { viewModel.toggleAudioMeter() },
-                            onToggleAutoNightPrompt = { viewModel.toggleAutoNightPrompt() }
+                            onToggleAutoNightPrompt = { viewModel.toggleAutoNightPrompt() },
+                            onToggleOpticalHdr = { viewModel.toggleOpticalHdr() },
+                            onToggleUltraHdr = { viewModel.toggleUltraHdr() }
                         )
                     }
 
@@ -1700,7 +1706,7 @@ fun CameraScreen(
                                         Color.White.copy(alpha = if (state.lastThumbnail != null) 0.55f else 0.18f),
                                         CircleShape
                                     )
-                                    .clickable { viewModel.openGallery() },
+                                    .clickable { viewModel.openLatestMedia() },
                                 contentAlignment = Alignment.Center
                             ) {
                                 val thumbBmp = state.lastThumbnail
@@ -1738,11 +1744,15 @@ fun CameraScreen(
                             }
                         }
 
-                        // Center: Clean Mechanical Shutter (White in Photo, Coral Red in Video, Deep Crimson in Astro Red UI!)
+                        // Center: Clean Mechanical Shutter (clickable covers FULL 76dp ring + center so edge taps NEVER miss!)
                         Box(
                             modifier = Modifier
-                                .size(72.dp)
+                                .size(76.dp)
                                 .clip(CircleShape)
+                                .clickable {
+                                    haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                                    viewModel.onShutterPressed()
+                                }
                                 .border(3.dp, if (astroRed) Color(0xFFDC2626) else Color.White, CircleShape)
                                 .padding(5.dp)
                                 .clip(CircleShape)
@@ -1752,11 +1762,7 @@ fun CameraScreen(
                                         isRecordingMode || isVideoRedShutter -> TrueLensPalette.RecordCoral
                                         else -> Color.White
                                     }
-                                )
-                                .clickable {
-                                    haptic.performHapticFeedback(HapticFeedbackType.LongPress)
-                                    viewModel.onShutterPressed()
-                                },
+                                ),
                             contentAlignment = Alignment.Center
                         ) {
                             if (isRecordingMode) {

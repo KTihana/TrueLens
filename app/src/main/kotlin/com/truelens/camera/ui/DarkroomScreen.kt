@@ -3,6 +3,7 @@ package com.truelens.camera.ui
 import android.content.Intent
 import android.graphics.Bitmap
 import android.net.Uri
+import android.util.LruCache
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
@@ -10,16 +11,17 @@ import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
-import androidx.compose.foundation.gestures.calculateCentroidSize
 import androidx.compose.foundation.gestures.calculatePan
 import androidx.compose.foundation.gestures.calculateZoom
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.pager.HorizontalPager
+import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.positionChanged
-import kotlin.math.abs
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -36,6 +38,7 @@ import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -86,6 +89,7 @@ import com.truelens.camera.grading.BuiltInPresets
 import com.truelens.camera.grading.GradePreset
 import com.truelens.camera.grading.LightroomGrade
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.util.Locale
 
@@ -145,22 +149,66 @@ fun DarkroomScreen(
         }
     }
 
+    val scope = rememberCoroutineScope()
     val displayBitmap = if (showOriginal) state.darkroomSourceBitmap else state.darkroomGradedBitmap
-    val recentShots by produceState<List<GalleryPhotoItem>>(initialValue = emptyList(), state.darkroomSourceUri) {
+    // Load gallery list once per Darkroom session so swiping never stalls on MediaStore IPC
+    val recentShots by produceState<List<GalleryPhotoItem>>(initialValue = emptyList(), Unit) {
         value = queryTrueLensGallery(context, includeVideos = false)
     }
     val currentUri = state.darkroomSourceUri ?: state.lastCapturedPhoto?.jpegUri
-    val currentPhotoIdx = remember(recentShots, currentUri) {
-        recentShots.indexOfFirst { it.uri == currentUri }
+    val galleryUris = remember(recentShots) { recentShots.map { it.uri } }
+    val pagerUris = remember(galleryUris, currentUri) {
+        if (galleryUris.isNotEmpty() && currentUri != null && currentUri in galleryUris) {
+            galleryUris
+        } else {
+            listOfNotNull(currentUri)
+        }
     }
-    var swipeDragX by remember(currentUri) { mutableFloatStateOf(0f) }
-    var photoZoom by remember(currentUri) { mutableFloatStateOf(1f) }
-    var photoPanX by remember(currentUri) { mutableFloatStateOf(0f) }
-    var photoPanY by remember(currentUri) { mutableFloatStateOf(0f) }
+
+    // Pre-decoded in-memory page cache so adjacent photos are already in RAM before you swipe
+    val pageBitmapCache = remember { LruCache<String, Bitmap>(7) }
+    if (currentUri != null) {
+        val srcBmp = state.darkroomSourceBitmap
+        if (srcBmp != null && !srcBmp.isRecycled && pageBitmapCache.get(currentUri.toString()) == null) {
+            pageBitmapCache.put(currentUri.toString(), srcBmp)
+        }
+    }
+
+    var photoZoom by remember { mutableFloatStateOf(1f) }
+    var photoPanX by remember { mutableFloatStateOf(0f) }
+    var photoPanY by remember { mutableFloatStateOf(0f) }
+
+    val pagerState = rememberPagerState(
+        initialPage = 0,
+        pageCount = { pagerUris.size.coerceAtLeast(1) }
+    )
+    var syncedPagerUris by remember { mutableStateOf<List<Uri>>(emptyList()) }
+
+    // Position pager immediately on currentUri once the gallery list arrives (no jump animation)
+    LaunchedEffect(pagerUris) {
+        val targetIdx = if (currentUri != null) pagerUris.indexOf(currentUri) else -1
+        if (targetIdx >= 0 && pagerState.currentPage != targetIdx) {
+            pagerState.scrollToPage(targetIdx)
+        }
+        syncedPagerUris = pagerUris
+    }
+
+    // Only sync ViewModel editing state after the pager settles — zero mid-swipe jank or flicker!
+    LaunchedEffect(pagerState.settledPage, syncedPagerUris) {
+        if (syncedPagerUris !== pagerUris) return@LaunchedEffect
+        val settledUri = pagerUris.getOrNull(pagerState.settledPage) ?: return@LaunchedEffect
+        if (settledUri != currentUri) {
+            photoZoom = 1f
+            photoPanX = 0f
+            photoPanY = 0f
+            onSelectFilmstripUri(settledUri)
+        }
+    }
+
     val filmstripListState = rememberLazyListState()
-    LaunchedEffect(currentPhotoIdx) {
-        if (currentPhotoIdx >= 0) {
-            filmstripListState.animateScrollToItem((currentPhotoIdx - 2).coerceAtLeast(0))
+    LaunchedEffect(pagerState.currentPage, pagerUris.size) {
+        if (pagerUris.size > 1) {
+            filmstripListState.animateScrollToItem((pagerState.currentPage - 2).coerceAtLeast(0))
         }
     }
 
@@ -348,97 +396,14 @@ fun DarkroomScreen(
             }
         }
 
-        // Rounded Photo Card (Pinch-to-Zoom 1x-6x + Pan + Double-Tap Zoom + Swipe Left/Right to browse!)
+        // Rounded Photo Card (Native HorizontalPager + Preloaded Neighbors + Pinch-to-Zoom 1x-6x + Double-Tap!)
         Box(
             modifier = Modifier
                 .weight(1f)
                 .fillMaxWidth()
                 .padding(horizontal = 14.dp)
                 .clip(RoundedCornerShape(24.dp))
-                .background(TrueLensPalette.SurfaceDark)
-                .pointerInput(currentUri, showKeyPhotoPicker) {
-                    if (!showKeyPhotoPicker) {
-                        detectTapGestures(
-                            onDoubleTap = {
-                                if (photoZoom > 1.05f) {
-                                    photoZoom = 1f
-                                    photoPanX = 0f
-                                    photoPanY = 0f
-                                } else {
-                                    photoZoom = 2.5f
-                                    photoPanX = 0f
-                                    photoPanY = 0f
-                                }
-                            }
-                        )
-                    }
-                }
-                .pointerInput(recentShots, currentPhotoIdx, showKeyPhotoPicker) {
-                    if (!showKeyPhotoPicker) {
-                        awaitEachGesture {
-                            awaitFirstDown(requireUnconsumed = false)
-                            var isMultiTouch = false
-                            var dragXAccum = 0f
-                            do {
-                                val event = awaitPointerEvent()
-                                val pressedCount = event.changes.count { it.pressed }
-                                if (pressedCount >= 2) {
-                                    isMultiTouch = true
-                                    swipeDragX = 0f
-                                    val zoomChange = event.calculateZoom()
-                                    val panChange = event.calculatePan()
-                                    val nextZoom = (photoZoom * zoomChange).coerceIn(1f, 6f)
-                                    photoZoom = nextZoom
-                                    if (nextZoom <= 1.02f) {
-                                        photoZoom = 1f
-                                        photoPanX = 0f
-                                        photoPanY = 0f
-                                    } else {
-                                        val maxPanX = size.width * (nextZoom - 1f) * 0.5f
-                                        val maxPanY = size.height * (nextZoom - 1f) * 0.5f
-                                        photoPanX = (photoPanX + panChange.x).coerceIn(-maxPanX, maxPanX)
-                                        photoPanY = (photoPanY + panChange.y).coerceIn(-maxPanY, maxPanY)
-                                    }
-                                    event.changes.forEach { if (it.positionChanged()) it.consume() }
-                                } else if (pressedCount == 1 && !isMultiTouch) {
-                                    val panChange = event.calculatePan()
-                                    if (photoZoom > 1.03f) {
-                                        // Pan smoothly inside zoomed photo
-                                        val maxPanX = size.width * (photoZoom - 1f) * 0.5f
-                                        val maxPanY = size.height * (photoZoom - 1f) * 0.5f
-                                        photoPanX = (photoPanX + panChange.x).coerceIn(-maxPanX, maxPanX)
-                                        photoPanY = (photoPanY + panChange.y).coerceIn(-maxPanY, maxPanY)
-                                        if (panChange.x != 0f || panChange.y != 0f) {
-                                            event.changes.forEach { if (it.positionChanged()) it.consume() }
-                                        }
-                                    } else if (recentShots.size > 1 && currentPhotoIdx >= 0) {
-                                        // At 1x zoom: swipe left/right to flip between photos!
-                                        if (abs(panChange.x) > abs(panChange.y) * 0.7f || abs(dragXAccum) > 12f) {
-                                            val atStart = currentPhotoIdx == 0 && (dragXAccum + panChange.x) > 0f
-                                            val atEnd = currentPhotoIdx == recentShots.lastIndex && (dragXAccum + panChange.x) < 0f
-                                            val damp = if (atStart || atEnd) 0.25f else 1f
-                                            dragXAccum = (dragXAccum + panChange.x * damp).coerceIn(-360f, 360f)
-                                            swipeDragX = dragXAccum
-                                            event.changes.forEach { if (it.positionChanged()) it.consume() }
-                                        }
-                                    }
-                                }
-                            } while (event.changes.any { it.pressed })
-
-                            if (!isMultiTouch && photoZoom <= 1.03f && recentShots.size > 1 && currentPhotoIdx >= 0) {
-                                val dx = swipeDragX
-                                swipeDragX = 0f
-                                if (dx < -80f && currentPhotoIdx < recentShots.lastIndex) {
-                                    onSelectFilmstripUri(recentShots[currentPhotoIdx + 1].uri)
-                                } else if (dx > 80f && currentPhotoIdx > 0) {
-                                    onSelectFilmstripUri(recentShots[currentPhotoIdx - 1].uri)
-                                }
-                            } else {
-                                swipeDragX = 0f
-                            }
-                        }
-                    }
-                },
+                .background(TrueLensPalette.SurfaceDark),
             contentAlignment = Alignment.Center
         ) {
             val activeKeyFrame = if (showKeyPhotoPicker && liveKeyFrames.isNotEmpty()) {
@@ -469,20 +434,128 @@ fun DarkroomScreen(
                     contentScale = ContentScale.Fit,
                     modifier = Modifier.fillMaxSize()
                 )
-            } else if (displayBitmap != null && !displayBitmap.isRecycled) {
-                Image(
-                    bitmap = displayBitmap.asImageBitmap(),
-                    contentDescription = "Photo Preview",
-                    contentScale = ContentScale.Fit,
-                    modifier = Modifier
-                        .fillMaxSize()
-                        .graphicsLayer {
-                            scaleX = photoZoom
-                            scaleY = photoZoom
-                            translationX = photoPanX + swipeDragX
-                            translationY = photoPanY
+            } else {
+                HorizontalPager(
+                    state = pagerState,
+                    beyondViewportPageCount = 1,
+                    pageSpacing = 12.dp,
+                    userScrollEnabled = photoZoom <= 1.03f && !showKeyPhotoPicker && !isPlayingLiveMotion && pagerUris.size > 1,
+                    key = { idx -> pagerUris.getOrNull(idx)?.toString() ?: "page_$idx" },
+                    modifier = Modifier.fillMaxSize()
+                ) { pageIdx ->
+                    val pageUri = pagerUris.getOrNull(pageIdx)
+                    val isActiveEditedPage = pageUri != null && pageUri == currentUri
+                    val cachedPageBitmap by produceState<Bitmap?>(
+                        initialValue = pageUri?.let { pageBitmapCache.get(it.toString()) },
+                        pageUri
+                    ) {
+                        if (pageUri == null) {
+                            value = null
+                            return@produceState
                         }
-                )
+                        val cacheKey = pageUri.toString()
+                        val existing = pageBitmapCache.get(cacheKey)
+                        if (existing != null && !existing.isRecycled) {
+                            value = existing
+                        } else {
+                            val decoded = withContext(Dispatchers.IO) {
+                                ExifBitmapLoader.loadScaled(context, pageUri, 1280)
+                            }
+                            if (decoded != null && !decoded.isRecycled) {
+                                pageBitmapCache.put(cacheKey, decoded)
+                            }
+                            value = decoded
+                        }
+                    }
+
+                    val pageBmp = if (isActiveEditedPage && displayBitmap != null && !displayBitmap.isRecycled) {
+                        displayBitmap
+                    } else {
+                        cachedPageBitmap
+                    }
+                    val isCurrentPage = pageIdx == pagerState.currentPage
+
+                    Box(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .pointerInput(pageUri, showKeyPhotoPicker) {
+                                if (!showKeyPhotoPicker) {
+                                    detectTapGestures(
+                                        onDoubleTap = {
+                                            if (photoZoom > 1.05f) {
+                                                photoZoom = 1f
+                                                photoPanX = 0f
+                                                photoPanY = 0f
+                                            } else {
+                                                photoZoom = 2.5f
+                                                photoPanX = 0f
+                                                photoPanY = 0f
+                                            }
+                                        }
+                                    )
+                                }
+                            }
+                            .pointerInput(pageUri, showKeyPhotoPicker) {
+                                if (!showKeyPhotoPicker) {
+                                    awaitEachGesture {
+                                        awaitFirstDown(requireUnconsumed = false)
+                                        var isMultiTouch = false
+                                        do {
+                                            val event = awaitPointerEvent()
+                                            val pressedCount = event.changes.count { it.pressed }
+                                            if (pressedCount >= 2) {
+                                                isMultiTouch = true
+                                                val zoomChange = event.calculateZoom()
+                                                val panChange = event.calculatePan()
+                                                val nextZoom = (photoZoom * zoomChange).coerceIn(1f, 6f)
+                                                photoZoom = nextZoom
+                                                if (nextZoom <= 1.02f) {
+                                                    photoZoom = 1f
+                                                    photoPanX = 0f
+                                                    photoPanY = 0f
+                                                } else {
+                                                    val maxPanX = size.width * (nextZoom - 1f) * 0.5f
+                                                    val maxPanY = size.height * (nextZoom - 1f) * 0.5f
+                                                    photoPanX = (photoPanX + panChange.x).coerceIn(-maxPanX, maxPanX)
+                                                    photoPanY = (photoPanY + panChange.y).coerceIn(-maxPanY, maxPanY)
+                                                }
+                                                event.changes.forEach { if (it.positionChanged()) it.consume() }
+                                            } else if (pressedCount == 1 && !isMultiTouch && photoZoom > 1.03f) {
+                                                // Zoomed in: pan smoothly inside the photo (leave 1x drags unconsumed for HorizontalPager!)
+                                                val panChange = event.calculatePan()
+                                                val maxPanX = size.width * (photoZoom - 1f) * 0.5f
+                                                val maxPanY = size.height * (photoZoom - 1f) * 0.5f
+                                                photoPanX = (photoPanX + panChange.x).coerceIn(-maxPanX, maxPanX)
+                                                photoPanY = (photoPanY + panChange.y).coerceIn(-maxPanY, maxPanY)
+                                                if (panChange.x != 0f || panChange.y != 0f) {
+                                                    event.changes.forEach { if (it.positionChanged()) it.consume() }
+                                                }
+                                            }
+                                        } while (event.changes.any { it.pressed })
+                                    }
+                                }
+                            },
+                        contentAlignment = Alignment.Center
+                    ) {
+                        if (pageBmp != null && !pageBmp.isRecycled) {
+                            Image(
+                                bitmap = pageBmp.asImageBitmap(),
+                                contentDescription = "Photo Preview",
+                                contentScale = ContentScale.Fit,
+                                modifier = Modifier
+                                    .fillMaxSize()
+                                    .graphicsLayer {
+                                        if (isCurrentPage && photoZoom > 1.001f) {
+                                            scaleX = photoZoom
+                                            scaleY = photoZoom
+                                            translationX = photoPanX
+                                            translationY = photoPanY
+                                        }
+                                    }
+                            )
+                        }
+                    }
+                }
             }
 
             // Zoom Level Pill (visible when pinched/zoomed in — tap to reset to 1x!)
@@ -512,8 +585,8 @@ fun DarkroomScreen(
                 }
             }
 
-            // Subtle photo index indicator when browsing multiple photos (e.g. 2 / 15)
-            if (recentShots.size > 1 && currentPhotoIdx >= 0 && !showKeyPhotoPicker) {
+            // Subtle photo index indicator when browsing multiple photos (updates live as you glide!)
+            if (pagerUris.size > 1 && !showKeyPhotoPicker) {
                 Box(
                     modifier = Modifier
                         .align(Alignment.TopEnd)
@@ -523,7 +596,7 @@ fun DarkroomScreen(
                         .padding(horizontal = 9.dp, vertical = 4.dp)
                 ) {
                     Text(
-                        text = "${currentPhotoIdx + 1} / ${recentShots.size}",
+                        text = "${pagerState.currentPage + 1} / ${pagerUris.size}",
                         color = Color.White.copy(alpha = 0.88f),
                         fontSize = 10.sp,
                         fontWeight = FontWeight.SemiBold
@@ -714,8 +787,12 @@ fun DarkroomScreen(
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
                 modifier = Modifier.fillMaxWidth()
             ) {
-                items(recentShots, key = { it.uri.toString() }) { item ->
-                    val isCurrent = item.uri == (state.darkroomSourceUri ?: state.lastCapturedPhoto?.jpegUri)
+                itemsIndexed(recentShots, key = { _, it -> it.uri.toString() }) { idx, item ->
+                    val isCurrent = if (pagerUris.size == recentShots.size) {
+                        idx == pagerState.currentPage
+                    } else {
+                        item.uri == currentUri
+                    }
                     val thumb by produceState<Bitmap?>(initialValue = null, item.uri) {
                         value = withContext(Dispatchers.IO) {
                             ExifBitmapLoader.loadScaled(context, item.uri, 160)
@@ -731,7 +808,16 @@ fun DarkroomScreen(
                                 if (isCurrent) Color.White else TrueLensPalette.GlassBorder,
                                 RoundedCornerShape(10.dp)
                             )
-                            .clickable { onSelectFilmstripUri(item.uri) }
+                            .clickable {
+                                photoZoom = 1f
+                                photoPanX = 0f
+                                photoPanY = 0f
+                                if (pagerUris.size == recentShots.size && idx in pagerUris.indices) {
+                                    scope.launch { pagerState.animateScrollToPage(idx) }
+                                } else {
+                                    onSelectFilmstripUri(item.uri)
+                                }
+                            }
                     ) {
                         val t = thumb
                         if (t != null && !t.isRecycled) {

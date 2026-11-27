@@ -285,184 +285,30 @@ object BitmapGrader {
     }
 
     /**
-     * Scientific Zero-AI 3-Stage Optical ISP Denoiser (OFF by default — Pure Zero-AI remains default!):
-     * 1) Decoupled YCbCr Edge-Aware Chroma Denoising (eliminates magenta/green sensor blotches with zero sharpness loss).
-     * 2) ISO- & Shadow-Adaptive Separable Strided Bilateral Luminance Filter + 18% Organic Texture Retention
-     *    (removes multi-pixel grain clumps on 12MP+ sensors without creating waxy/plastic skin).
+     * Scientific Zero-AI Computational Denoiser (OFF by default — Pure Zero-AI remains default!):
+     * Delegates to [ComputationalDenoiser]:
+     * 1) 2-Scale Edge-Guided Chroma Pyramid (eliminates 1..24px magenta/green shadow color blotches).
+     * 2) Donoho MAD Noise Calibration + 3-Octave Edge-Stopping À-Trous Wavelet Shrinkage
+     *    (removes fine, medium & coarse luminance grain clumps while keeping crisp edges & natural skin).
      * 3) Coring (Thresholded) Micro-Clarity (crisps real optical edges while applying ZERO sharpening to flat areas).
      */
-    fun applyCleanEnhance(source: Bitmap, iso: Int = 400): Bitmap {
-        val w = source.width
-        val h = source.height
-        if (w < 8 || h < 8) return source
-        val pixels = IntArray(w * h)
-        source.getPixels(pixels, 0, w, 0, 0, w, h)
-        denoisePixelsInPlace(pixels, w, h, iso)
-        return Bitmap.createBitmap(pixels, w, h, Bitmap.Config.ARGB_8888)
+    fun applyCleanEnhance(source: Bitmap, iso: Int = 400, mergedFrameCount: Int = 1): Bitmap {
+        return ComputationalDenoiser.denoiseSingle(source, iso = iso, mergedFrameCount = mergedFrameCount)
     }
 
-    internal fun denoisePixelsInPlace(pixels: IntArray, w: Int, h: Int, iso: Int = 400) {
-        val count = w * h
-        if (w < 8 || h < 8 || pixels.size < count) return
-
-        val yPlane = FloatArray(count)
-        val cbPlane = FloatArray(count)
-        val crPlane = FloatArray(count)
-
-        // Convert RGB -> BT.709 YCbCr so Chroma & Luminance noise are processed independently
-        for (i in 0 until count) {
-            val c = pixels[i]
-            val r = ((c shr 16) and 0xFF).toFloat()
-            val g = ((c shr 8) and 0xFF).toFloat()
-            val b = (c and 0xFF).toFloat()
-            yPlane[i] = 0.2126f * r + 0.7152f * g + 0.0722f * b
-            cbPlane[i] = -0.1146f * r - 0.3854f * g + 0.5000f * b + 128f
-            crPlane[i] = 0.5000f * r - 0.4542f * g - 0.0458f * b + 128f
-        }
-
-        // Resolution-aware kernel scale (real 12MP phone grain clumps span 3-7px!)
-        val hiRes = maxOf(w, h) >= 1600
-        val chromaRadius = if (hiRes) 4 else 2
-        val chromaEdgeStop = 38f
-
-        // STAGE 1: Edge-Aware Separable Chroma Noise Reduction (Cb & Cr only — preserves 100% of edge sharpness!)
-        val cbTmp = FloatArray(count)
-        val crTmp = FloatArray(count)
-        for (y in 0 until h) {
-            val row = y * w
-            for (x in 0 until w) {
-                val idx = row + x
-                val cy = yPlane[idx]
-                var sCb = cbPlane[idx]
-                var sCr = crPlane[idx]
-                var wSum = 1f
-                for (d in -chromaRadius..chromaRadius) {
-                    if (d == 0) continue
-                    val nx = (x + d).coerceIn(0, w - 1)
-                    val ni = row + nx
-                    val dy = abs(yPlane[ni] - cy)
-                    if (dy < chromaEdgeStop) {
-                        val wt = 1f - (dy / chromaEdgeStop) * 0.65f
-                        sCb += cbPlane[ni] * wt
-                        sCr += crPlane[ni] * wt
-                        wSum += wt
-                    }
-                }
-                cbTmp[idx] = sCb / wSum
-                crTmp[idx] = sCr / wSum
-            }
-        }
-        for (y in 0 until h) {
-            val row = y * w
-            for (x in 0 until w) {
-                val idx = row + x
-                val cy = yPlane[idx]
-                var sCb = cbTmp[idx]
-                var sCr = crTmp[idx]
-                var wSum = 1f
-                for (d in -chromaRadius..chromaRadius) {
-                    if (d == 0) continue
-                    val ny = (y + d).coerceIn(0, h - 1)
-                    val ni = ny * w + x
-                    val dy = abs(yPlane[ni] - cy)
-                    if (dy < chromaEdgeStop) {
-                        val wt = 1f - (dy / chromaEdgeStop) * 0.65f
-                        sCb += cbTmp[ni] * wt
-                        sCr += crTmp[ni] * wt
-                        wSum += wt
-                    }
-                }
-                cbPlane[idx] = sCb / wSum
-                crPlane[idx] = sCr / wSum
-            }
-        }
-
-        // STAGE 2: ISO- & Shadow-Adaptive Separable Bilateral Luminance Filter (Y only)
-        // Photon shot noise scales with ISO and is strongest in low-luminance shadows.
-        val isoFactor = ((iso.coerceIn(100, 3200) - 100f) / 1500f).coerceIn(0f, 1.4f)
-        val sigmaMid = 15f + isoFactor * 11f        // 15..30 (crisp midtones/skin)
-        val sigmaShadow = sigmaMid * 1.42f          // gentler shadow cleanup where SNR is lowest
-        val lutMid = FloatArray(256) { d -> kotlin.math.exp(-(d * d) / (2f * sigmaMid * sigmaMid)) }
-        val lutShadow = FloatArray(256) { d -> kotlin.math.exp(-(d * d) / (2f * sigmaShadow * sigmaShadow)) }
-
-        val step = if (hiRes) 2 else 1
-        val offsets = intArrayOf(-2 * step, -step, 0, step, 2 * step)
-        val spatialW = floatArrayOf(0.55f, 0.85f, 1.0f, 0.85f, 0.55f)
-
-        val yTmp = FloatArray(count)
-        for (y in 0 until h) {
-            val row = y * w
-            for (x in 0 until w) {
-                val idx = row + x
-                val cy = yPlane[idx]
-                val lut = if (cy < 92f) lutShadow else lutMid
-                var acc = 0f
-                var wSum = 0f
-                for (k in 0 until 5) {
-                    val nx = (x + offsets[k]).coerceIn(0, w - 1)
-                    val nyVal = yPlane[row + nx]
-                    val diff = abs(nyVal - cy).toInt().coerceIn(0, 255)
-                    val wt = spatialW[k] * lut[diff]
-                    acc += nyVal * wt
-                    wSum += wt
-                }
-                yTmp[idx] = acc / wSum.coerceAtLeast(1e-4f)
-            }
-        }
-
-        val yClean = FloatArray(count)
-        for (y in 0 until h) {
-            val row = y * w
-            for (x in 0 until w) {
-                val idx = row + x
-                val cy = yTmp[idx]
-                val lut = if (cy < 92f) lutShadow else lutMid
-                var acc = 0f
-                var wSum = 0f
-                for (k in 0 until 5) {
-                    val ny = (y + offsets[k]).coerceIn(0, h - 1)
-                    val nyVal = yTmp[ny * w + x]
-                    val diff = abs(nyVal - cy).toInt().coerceIn(0, 255)
-                    val wt = spatialW[k] * lut[diff]
-                    acc += nyVal * wt
-                    wSum += wt
-                }
-                val denoisedY = acc / wSum.coerceAtLeast(1e-4f)
-                // Anti-Plastic Organic Retention: keep 18% of original luminance micro-texture so skin stays natural
-                yClean[idx] = denoisedY * 0.82f + yPlane[idx] * 0.18f
-            }
-        }
-
-        // STAGE 3: Coring (Thresholded) Optical Micro-Clarity — ONLY crisps real edges, NEVER sharpens flat grain!
-        val coringDeadZone = 6.5f
-        val clarityStrength = 0.20f
-        for (y in 0 until h) {
-            val row = y * w
-            val rowUp = (y - 1).coerceAtLeast(0) * w
-            val rowDn = (y + 1).coerceAtMost(h - 1) * w
-            for (x in 0 until w) {
-                val idx = row + x
-                val xL = (x - 1).coerceAtLeast(0)
-                val xR = (x + 1).coerceAtMost(w - 1)
-                val yc = yClean[idx]
-                val localAvg = (yc * 2f + yClean[rowUp + x] + yClean[rowDn + x] + yClean[row + xL] + yClean[row + xR]) / 6f
-                val diff = yc - localAvg
-                val edgeBoost = when {
-                    diff > coringDeadZone -> ((diff - coringDeadZone) * clarityStrength).coerceAtMost(14f)
-                    diff < -coringDeadZone -> ((diff + coringDeadZone) * clarityStrength).coerceAtLeast(-14f)
-                    else -> 0f // flat noisy region: ZERO sharpening!
-                }
-
-                val yf = (yc + edgeBoost).coerceIn(0f, 255f)
-                val cb = cbPlane[idx] - 128f
-                val cr = crPlane[idx] - 128f
-
-                // BT.709 YCbCr -> RGB
-                val r = (yf + 1.5748f * cr).toInt().coerceIn(0, 255)
-                val g = (yf - 0.1873f * cb - 0.4681f * cr).toInt().coerceIn(0, 255)
-                val b = (yf + 1.8556f * cb).toInt().coerceIn(0, 255)
-                pixels[idx] = (0xFF shl 24) or (r shl 16) or (g shl 8) or b
-            }
-        }
+    internal fun denoisePixelsInPlace(
+        pixels: IntArray,
+        w: Int,
+        h: Int,
+        iso: Int = 400,
+        mergedFrameCount: Int = 1
+    ) {
+        ComputationalDenoiser.denoisePixelsInPlace(
+            pixels = pixels,
+            w = w,
+            h = h,
+            iso = iso,
+            mergedFrameCount = mergedFrameCount
+        )
     }
 }
